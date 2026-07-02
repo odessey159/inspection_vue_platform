@@ -1,0 +1,16 @@
+.git
+.gitignore
+.runtime
+.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/node_modules
+**/dist
+output
+inputs
+backend/.venv
+backend/extracted
+backend/scenes
+backend/summaries
+hazard_recognition_sample/outputs

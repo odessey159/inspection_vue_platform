@@ -1,0 +1,9 @@
+float64 stamp
+int32 id
+int32 label
+float32 x
+float32 y
+float32 z
+float32 width
+float32 length
+float32 height

@@ -1,0 +1,7 @@
+bool has_error
+uint8 control_mode
+bool buzzer_enabled
+bool remote_controller_enabled
+bool brake_enabled
+bool special_func_enabled
+int32 gear

@@ -1,0 +1,21 @@
+bool is_vehicle_spd_valid
+float64 vehicle_spd
+bool is_wheel_spd_rr_valid
+uint8 wheel_direction_rr
+float64 wheel_spd_rr
+bool is_wheel_spd_rl_valid
+uint8 wheel_direction_rl
+float64 wheel_spd_rl
+bool is_wheel_spd_fr_valid
+uint8 wheel_direction_fr
+float64 wheel_spd_fr
+bool is_wheel_spd_fl_valid
+uint8 wheel_direction_fl
+float64 wheel_spd_fl
+bool is_wheel_spd_accuracy_rr_valid
+float64 wheel_spd_accuracy_rr
+uint8 wheel_direction_accuracy_rr
+bool is_wheel_spd_accuracy_rl_valid
+float64 wheel_spd_accuracy_rl
+uint8 wheel_direction_accuracy_rl
+

@@ -1,0 +1,4 @@
+uint8 motor_error
+uint8 driver_error
+uint8 com_error
+uint8 other_error

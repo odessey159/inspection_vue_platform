@@ -1,0 +1,7 @@
+float64 left_laser
+float64 right_laser
+float64 load_sensor
+float64 load_sensor_trailer
+bool rtgc_lidar
+bool rtgc_lidar1
+int32 light_sensor

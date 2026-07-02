@@ -1,0 +1,22 @@
+{
+  "name": "inspection-vue-platform-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "three": "^0.165.0",
+    "vue": "^3.4.31"
+  },
+  "devDependencies": {
+    "@types/three": "^0.183.1",
+    "@vitejs/plugin-vue": "^5.0.5",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.12",
+    "vue-tsc": "^2.0.19"
+  }
+}

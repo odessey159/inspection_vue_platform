@@ -1,0 +1,7 @@
+std_msgs/Header header
+
+bool crane_arrive
+bool front_container_loaded
+bool back_container_loaded
+float32 object_height
+uint32 precise_stop_status

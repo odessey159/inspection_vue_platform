@@ -1,0 +1,2 @@
+bool is_fault
+int32 fault_code

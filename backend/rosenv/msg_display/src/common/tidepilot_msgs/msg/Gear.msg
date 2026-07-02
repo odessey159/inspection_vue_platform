@@ -1,0 +1,5 @@
+bool is_shift_position_valid
+uint8 gear_state
+bool driver_override
+uint8 gear_cmd
+bool canbus_fault

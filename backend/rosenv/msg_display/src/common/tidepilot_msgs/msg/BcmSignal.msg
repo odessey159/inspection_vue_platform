@@ -1,0 +1,17 @@
+uint8 beam_signal 
+uint8 turn_signal 
+bool danger_alarm_lamp_signal 
+bool clearance_lamp_signal 
+bool reversing_lamp_signal
+bool brk_lamp_signal
+bool alarm_lamp_signal
+bool collision_lamp_signal
+bool collision_beep_signal
+uint8 foglight_signal 
+bool horn_signal
+uint8 left_window_signal
+uint8 right_window_signal
+uint8 wiper_signal
+bool air_condition_signal
+uint8 battary_swap
+bool battary_swap_verify

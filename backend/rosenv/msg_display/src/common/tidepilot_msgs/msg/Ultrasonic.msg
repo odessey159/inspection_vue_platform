@@ -1,0 +1,21 @@
+uint8 NORMAL_DISTANCE=0
+uint8 NO_OBSTACLE=1
+uint8 LESS_THAN_MINIMUM_DISTANCE=2
+uint8 ERROR=3
+
+uint8 ultrasonic_status_1
+int32 ultrasonic_data_1
+uint8 ultrasonic_status_2
+int32 ultrasonic_data_2
+uint8 ultrasonic_status_3
+int32 ultrasonic_data_3
+uint8 ultrasonic_status_4
+int32 ultrasonic_data_4
+uint8 ultrasonic_status_5
+int32 ultrasonic_data_5
+uint8 ultrasonic_status_6
+int32 ultrasonic_data_6
+uint8 ultrasonic_status_7
+int32 ultrasonic_data_7
+uint8 ultrasonic_status_8
+int32 ultrasonic_data_8

@@ -1,0 +1,87 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: inspection-vue-platform-backend
+    restart: unless-stopped
+    environment:
+      APP_HOME: ${APP_HOME:-/app}
+      RUNTIME_DIR: ${RUNTIME_DIR:-/app/.runtime}
+      PROJECTS_DIR: ${PROJECTS_DIR:-/app/.runtime/projects}
+      DATABASE_PATH: ${DATABASE_PATH:-/app/.runtime/inspection.db}
+      INPUTS_DIR: ${INPUTS_DIR:-/app/inputs}
+      CONFIG_DIR: ${CONFIG_DIR:-/app/config}
+      ROSENV_DIR: ${ROSENV_DIR:-/app/backend/rosenv}
+      DEFAULT_STANDARDS_DIR: ${DEFAULT_STANDARDS_DIR:-/app/inputs/standards}
+      SECURITY_CHECK_CALIBRATION_PATH: ${SECURITY_CHECK_CALIBRATION_PATH:-/app/config/security_check.yaml}
+      DISCOVERY_ROOTS: ${DISCOVERY_ROOTS:-/app/inputs,/app}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:8080,http://localhost:8080}
+      FFMPEG_BIN: ${FFMPEG_BIN:-ffmpeg}
+      COLMAP_BIN: ${COLMAP_BIN:-}
+      VISION_PROVIDER: ${VISION_PROVIDER:-dashscope}
+      VISION_API_URL: ${VISION_API_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      VISION_API_KEY: ${VISION_API_KEY:-}
+      VISION_MODEL: ${VISION_MODEL:-qwen3.5-plus}
+      VISION_CLIP_SECONDS: ${VISION_CLIP_SECONDS:-25}
+      VISION_VIDEO_FPS: ${VISION_VIDEO_FPS:-1}
+      VISION_MAX_CLIP_BYTES: ${VISION_MAX_CLIP_BYTES:-7340032}
+      VISION_MAX_FINDINGS_PER_CLIP: ${VISION_MAX_FINDINGS_PER_CLIP:-4}
+      VISION_MAX_RETRIES: ${VISION_MAX_RETRIES:-2}
+      VISION_REQUEST_TIMEOUT_SECONDS: ${VISION_REQUEST_TIMEOUT_SECONDS:-120}
+      VISION_TEMPERATURE: ${VISION_TEMPERATURE:-0.1}
+      VISION_ENABLE_THINKING: ${VISION_ENABLE_THINKING:-false}
+      SCENE_VOXEL_SIZE: ${SCENE_VOXEL_SIZE:-0.08}
+      SCENE_MAX_POINTS: ${SCENE_MAX_POINTS:-600000}
+      SCENE_MAX_SOURCE_FRAMES: ${SCENE_MAX_SOURCE_FRAMES:-0}
+      SCENE_MAX_TRAJECTORY_SAMPLES: ${SCENE_MAX_TRAJECTORY_SAMPLES:-1500}
+      SCENE_ROOF_QUANTILE: ${SCENE_ROOF_QUANTILE:-0.92}
+      SCENE_FLOOR_CUT_QUANTILE: ${SCENE_FLOOR_CUT_QUANTILE:-0.35}
+      SCENE_FLOOR_CUT_MIN_LIFT: ${SCENE_FLOOR_CUT_MIN_LIFT:-0.45}
+      SCENE_FLOOR_CUT_MAX_LIFT: ${SCENE_FLOOR_CUT_MAX_LIFT:-0.72}
+      SCENE_LOW_OUTLIER_QUANTILE: ${SCENE_LOW_OUTLIER_QUANTILE:-0.01}
+      SCENE_HIGH_OUTLIER_QUANTILE: ${SCENE_HIGH_OUTLIER_QUANTILE:-0.995}
+      SCENE_RENDER_TARGET_POINTS: ${SCENE_RENDER_TARGET_POINTS:-600000}
+      SCENE_RENDER_MAX_POINTS: ${SCENE_RENDER_MAX_POINTS:-600000}
+      SCENE_CALIBRATION_SAMPLE_FRAMES: ${SCENE_CALIBRATION_SAMPLE_FRAMES:-6}
+      SCENE_CALIBRATION_SAMPLE_POINTS: ${SCENE_CALIBRATION_SAMPLE_POINTS:-1600}
+      SCENE_EGO_FILTER_ENABLED: ${SCENE_EGO_FILTER_ENABLED:-true}
+      SCENE_EGO_FILTER_SAMPLE_FRAMES: ${SCENE_EGO_FILTER_SAMPLE_FRAMES:-160}
+      SCENE_EGO_FILTER_VOXEL_SIZE: ${SCENE_EGO_FILTER_VOXEL_SIZE:-0.08}
+      SCENE_EGO_FILTER_MIN_HIT_RATIO: ${SCENE_EGO_FILTER_MIN_HIT_RATIO:-0.08}
+      SCENE_EGO_FILTER_EXPAND_CELLS: ${SCENE_EGO_FILTER_EXPAND_CELLS:-1}
+      SCENE_EGO_FILTER_MIN_X: ${SCENE_EGO_FILTER_MIN_X:--1.55}
+      SCENE_EGO_FILTER_MAX_X: ${SCENE_EGO_FILTER_MAX_X:-1.55}
+      SCENE_EGO_FILTER_MIN_Y: ${SCENE_EGO_FILTER_MIN_Y:--1.05}
+      SCENE_EGO_FILTER_MAX_Y: ${SCENE_EGO_FILTER_MAX_Y:-1.05}
+      SCENE_EGO_FILTER_MIN_Z: ${SCENE_EGO_FILTER_MIN_Z:--0.45}
+      SCENE_EGO_FILTER_MAX_Z: ${SCENE_EGO_FILTER_MAX_Z:-1.35}
+      SCENE_EGO_SWEEP_FILTER_ENABLED: ${SCENE_EGO_SWEEP_FILTER_ENABLED:-true}
+      SCENE_EGO_SWEEP_RADIUS: ${SCENE_EGO_SWEEP_RADIUS:-0.72}
+      SCENE_EGO_SWEEP_MIN_Z_OFFSET: ${SCENE_EGO_SWEEP_MIN_Z_OFFSET:--0.35}
+      SCENE_EGO_SWEEP_MAX_Z_OFFSET: ${SCENE_EGO_SWEEP_MAX_Z_OFFSET:-1.15}
+      SCENE_EGO_SWEEP_SAMPLE_COUNT: ${SCENE_EGO_SWEEP_SAMPLE_COUNT:-1200}
+      CLIP_LENGTH_SECONDS: ${CLIP_LENGTH_SECONDS:-25}
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./.runtime:/app/.runtime
+      - ./inputs:/app/inputs
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; print(urlopen('http://127.0.0.1:8010/healthz').read().decode())"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    container_name: inspection-vue-platform-web
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8080:80"

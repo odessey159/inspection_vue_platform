@@ -9,13 +9,23 @@ from fastapi.staticfiles import StaticFiles
 from .db import create_db_and_tables
 from .routers.findings import router as findings_router
 from .routers.projects import router as projects_router
+from .services.rtsp_recorder import start_rtsp_recording_cleanup_worker, stop_rtsp_recording_cleanup_worker
+from .services.rtsp_vehicles import ensure_robot_runtime_dirs
+from .services.rtsp_watchdog import start_rtsp_watchdog, stop_rtsp_watchdog
 from .settings import CORS_ORIGINS, PROJECTS_DIR
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     create_db_and_tables()
-    yield
+    ensure_robot_runtime_dirs()
+    start_rtsp_recording_cleanup_worker()
+    start_rtsp_watchdog()
+    try:
+        yield
+    finally:
+        stop_rtsp_watchdog()
+        stop_rtsp_recording_cleanup_worker()
 
 
 app = FastAPI(

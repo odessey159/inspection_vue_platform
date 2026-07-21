@@ -1,0 +1,17 @@
+# Double-click:
+#   backend/tests/start_dev_stack_ui.bat
+#
+# Or from repo root:
+#   powershell -ExecutionPolicy Bypass -File backend/tests/start_dev_stack_ui.ps1
+#   python backend/tests/dev_stack_ui.py
+#
+# Buttons: MediaMTX / 打开推流 / 关闭推流 / 打开 YOLO / 重建 Docker
+#
+# Manual fallback:
+#   powershell -ExecutionPolicy Bypass -File backend/tests/start_rtsp_server.ps1
+#   python backend/tests/generate_rtsp_stream.py
+#   powershell -ExecutionPolicy Bypass -File backend/scripts/run_yolo_service.ps1
+#
+# Publishes:
+#   video: rtsp://127.0.0.1:18554/live
+#   time:  rtsp://127.0.0.1:18554/time

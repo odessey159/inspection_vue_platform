@@ -35,6 +35,10 @@ def _env_list(name: str, default: list[Path]) -> list[Path]:
     return resolved_values
 
 
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _load_env_file(path: Path) -> None:
     if not path.exists():
         return
@@ -59,10 +63,45 @@ for env_path in (
     _load_env_file(env_path)
 
 
+def _runtime_project_count(runtime_dir: Path) -> int:
+    db_path = runtime_dir / "inspection.db"
+    if not db_path.is_file():
+        return 0
+    try:
+        import sqlite3
+
+        connection = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        try:
+            row = connection.execute("SELECT COUNT(*) FROM project").fetchone()
+        finally:
+            connection.close()
+        return int(row[0]) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
+def _prefer_populated_runtime_dir(configured: Path) -> Path:
+    configured = configured.resolve()
+    workspace_runtime = (ROOT_DIR / ".runtime").resolve()
+    if configured == workspace_runtime:
+        return configured
+    configured_count = _runtime_project_count(configured)
+    workspace_count = _runtime_project_count(workspace_runtime)
+    if workspace_count > configured_count:
+        return workspace_runtime
+    return configured
+
+
 APP_HOME = _env_path("APP_HOME", ROOT_DIR)
-RUNTIME_DIR = _env_path("RUNTIME_DIR", APP_HOME / ".runtime")
-PROJECTS_DIR = _env_path("PROJECTS_DIR", RUNTIME_DIR / "projects")
-DATABASE_PATH = _env_path("DATABASE_PATH", RUNTIME_DIR / "inspection.db")
+_configured_runtime_dir = _env_path("RUNTIME_DIR", APP_HOME / ".runtime")
+RUNTIME_DIR = _prefer_populated_runtime_dir(_configured_runtime_dir)
+_runtime_dir_overridden = RUNTIME_DIR.resolve() != _configured_runtime_dir.resolve()
+if _runtime_dir_overridden:
+    PROJECTS_DIR = (RUNTIME_DIR / "projects").resolve()
+    DATABASE_PATH = (RUNTIME_DIR / "inspection.db").resolve()
+else:
+    PROJECTS_DIR = _env_path("PROJECTS_DIR", RUNTIME_DIR / "projects")
+    DATABASE_PATH = _env_path("DATABASE_PATH", RUNTIME_DIR / "inspection.db")
 INPUTS_DIR = _env_path("INPUTS_DIR", APP_HOME / "inputs")
 CONFIG_DIR = _env_path("CONFIG_DIR", APP_HOME / "config")
 ROSENV_DIR = _env_path("ROSENV_DIR", BACKEND_DIR / "rosenv")
@@ -107,6 +146,27 @@ VISION_REQUEST_TIMEOUT_SECONDS = int(os.getenv("VISION_REQUEST_TIMEOUT_SECONDS",
 VISION_TEMPERATURE = float(os.getenv("VISION_TEMPERATURE", "0.1"))
 VISION_ENABLE_THINKING = os.getenv("VISION_ENABLE_THINKING", "false").strip().lower() in {"1", "true", "yes", "on"}
 
+YOLO_API_URL = os.getenv("YOLO_API_URL", "").strip()
+YOLO_API_KEY = os.getenv("YOLO_API_KEY", "").strip()
+YOLO_DETECT_PATH = os.getenv("YOLO_DETECT_PATH", "/predict/video").strip()
+YOLO_RTSP_DETECT_PATH = os.getenv("YOLO_RTSP_DETECT_PATH", "/predict/rtsp").strip()
+YOLO_RTSP_DEFAULT_DURATION_SEC = float(os.getenv("YOLO_RTSP_DEFAULT_DURATION_SEC", "60"))
+YOLO_RTSP_MAX_DURATION_SEC = float(os.getenv("YOLO_RTSP_MAX_DURATION_SEC", "600"))
+YOLO_RTSP_SEGMENT_SECONDS = float(os.getenv("YOLO_RTSP_SEGMENT_SECONDS", "10"))
+YOLO_RTSP_TRANSPORT = os.getenv("YOLO_RTSP_TRANSPORT", "tcp").strip().lower()
+YOLO_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONFIDENCE_THRESHOLD", "0.25"))
+YOLO_MAX_RETRIES = int(os.getenv("YOLO_MAX_RETRIES", "2"))
+YOLO_REQUEST_TIMEOUT_SECONDS = int(os.getenv("YOLO_REQUEST_TIMEOUT_SECONDS", "180"))
+YOLO_FAIL_OPEN = os.getenv("YOLO_FAIL_OPEN", "false").strip().lower() in {"1", "true", "yes", "on"}
+LLM_LOG_DIR = _env_path("LLM_LOG_DIR", RUNTIME_DIR / "LLM_log")
+
+RULE_DB_PATH = _env_path("RULE_DB_PATH", BACKEND_DIR / "data" / "rules.db")
+OBJECT_ALIASES_PATH = _env_path("OBJECT_ALIASES_PATH", BACKEND_DIR / "config" / "object_aliases.yaml")
+RTSP_VEHICLES_PATH = _env_path("RTSP_VEHICLES_PATH", BACKEND_DIR / "config" / "rtsp_vehicles.yaml")
+RULE_RAG_ENABLED = _env_bool("RULE_RAG_ENABLED", "true")
+RULE_RETRIEVAL_TOP_K = int(os.getenv("RULE_RETRIEVAL_TOP_K", "20"))
+RULE_RAG_FALLBACK_TOP_K = int(os.getenv("RULE_RAG_FALLBACK_TOP_K", "15"))
+
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -117,10 +177,6 @@ CORS_ORIGINS = [
 ]
 
 DISCOVERY_ROOTS = _env_list("DISCOVERY_ROOTS", [INPUTS_DIR, APP_HOME])
-
-
-def _env_bool(name: str, default: str = "false") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 ROSBAG_TOOLS_DIR = ROSENV_DIR / "tools"
@@ -160,9 +216,46 @@ SCENE_EGO_SWEEP_MAX_Z_OFFSET = float(os.getenv("SCENE_EGO_SWEEP_MAX_Z_OFFSET", "
 SCENE_EGO_SWEEP_SAMPLE_COUNT = int(os.getenv("SCENE_EGO_SWEEP_SAMPLE_COUNT", "1200"))
 CLIP_LENGTH_SECONDS = int(os.getenv("CLIP_LENGTH_SECONDS", "25"))
 
+RTSP_RECORDINGS_DIR = _env_path("RTSP_RECORDINGS_DIR", RUNTIME_DIR / "rtsp_recordings")
+# Per-vehicle runtime layout: .runtime/robots/<vehicle_id>/{recordings,maps}
+# Existing rtsp_recordings/ is left untouched until callers are migrated.
+ROBOTS_DIR = _env_path("ROBOTS_DIR", RUNTIME_DIR / "robots")
+ROBOT_RECORDINGS_DIRNAME = "recordings"
+ROBOT_MAPS_DIRNAME = "maps"
+RTSP_RECORDING_CLEANUP_ENABLED = _env_bool("RTSP_RECORDING_CLEANUP_ENABLED", "false")
+RTSP_RECORDING_CLEANUP_INTERVAL_SECONDS = int(os.getenv("RTSP_RECORDING_CLEANUP_INTERVAL_SECONDS", "300"))
+RTSP_WATCH_ENABLED = _env_bool("RTSP_WATCH_ENABLED", "true")
+RTSP_WATCH_POLL_INTERVAL_SECONDS = float(os.getenv("RTSP_WATCH_POLL_INTERVAL_SECONDS", "5"))
+RTSP_WATCH_TEST_MODE = _env_bool("RTSP_WATCH_TEST_MODE", "true")
+RTSP_WATCH_TEST_MAX_SECONDS = float(os.getenv("RTSP_WATCH_TEST_MAX_SECONDS", "600"))
+RTSP_WATCH_TEST_MAX_RECORDINGS = int(os.getenv("RTSP_WATCH_TEST_MAX_RECORDINGS", "5"))
+# Batch auto-analysis on RTSP connect (side path). Empty = disabled; monitor LLM is the main live path.
+RTSP_WATCH_AUTO_ANALYSIS_MODE = os.getenv("RTSP_WATCH_AUTO_ANALYSIS_MODE", "").strip().lower()
+# Continuous YOLO monitor: send each segment to the LLM via LangChain (main live path).
+RTSP_YOLO_MONITOR_LLM_ENABLED = _env_bool("RTSP_YOLO_MONITOR_LLM_ENABLED", "true")
+# When false, skip LLM if the segment has zero detections (saves API cost).
+RTSP_YOLO_MONITOR_LLM_ON_EMPTY = _env_bool("RTSP_YOLO_MONITOR_LLM_ON_EMPTY", "false")
+# Capture a short clip per monitor segment for multimodal LLM review (prefer cut from watchdog recording).
+RTSP_YOLO_MONITOR_CAPTURE_CLIP = _env_bool("RTSP_YOLO_MONITOR_CAPTURE_CLIP", "true")
+# When False the frontend behaves as if always in RTSP-live: point-cloud map panel stays hidden,
+# placeholder scenes are never upgraded, and per-vehicle maps are ignored even when present.
+POINT_CLOUD_ENABLED = _env_bool("POINT_CLOUD_ENABLED", "true")
+
+# Timeout (seconds) for each ffmpeg subprocess that compresses/encodes clip segments.
+# Prevents indefinite hangs when ffmpeg stalls on corrupt input.
+CLIP_COMPRESS_TIMEOUT_SECONDS = int(os.getenv("CLIP_COMPRESS_TIMEOUT_SECONDS", "120"))
+
+# Maximum number of concurrent daemon threads that run LLM review for YOLO monitor
+# segments. Limits memory pressure from base64-encoded video buffers.
+RTSP_LLM_REVIEW_MAX_WORKERS = int(os.getenv("RTSP_LLM_REVIEW_MAX_WORKERS", "4"))
+
 
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+RTSP_RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+ROBOTS_DIR.mkdir(parents=True, exist_ok=True)
+LLM_LOG_DIR.mkdir(parents=True, exist_ok=True)
+RULE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 

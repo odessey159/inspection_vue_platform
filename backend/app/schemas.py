@@ -10,11 +10,14 @@ class ProjectImportRequest(BaseModel):
     name: str = Field(default="Inspection Workspace")
     bag_dir: str
     standards_dir: str
+    rtsp_duration_sec: Optional[float] = Field(default=None, gt=0)
+    rtsp_transport: Optional[Literal["tcp", "udp"]] = "tcp"
 
 
 class AnalyzeRequest(BaseModel):
-    mode: Literal["demo", "provider"] = "demo"
+    mode: Literal["demo", "provider", "provider_yolo"] = "demo"
     model: Optional[str] = None
+    record_fresh_rtsp: bool = False
 
 
 class FindingPatchRequest(BaseModel):
@@ -23,20 +26,72 @@ class FindingPatchRequest(BaseModel):
     needs_review: Optional[bool] = None
 
 
+class RtspVehicleResponse(BaseModel):
+    id: str
+    name: str
+    rtsp_url: str
+
+
 class BootstrapResponse(BaseModel):
     sample_bag_dir: Optional[str]
+    sample_scene_path: Optional[str] = None
+    sample_pcd_path: Optional[str] = None
     sample_standards_dir: Optional[str]
+    default_rtsp_url: str
+    default_rtsp_record_seconds: float
+    rtsp_vehicles: list[RtspVehicleResponse] = Field(default_factory=list)
     detected_bag_dirs: list[str]
     detected_standards_dirs: list[str]
     provider_available: bool = False
+    yolo_available: bool = False
+    provider_yolo_available: bool = False
     default_analysis_model: Optional[str] = None
     supported_analysis_models: list[str] = Field(default_factory=list)
+    rtsp_watch_test_mode: bool = True
+    rtsp_watch_test_max_seconds: float = 600.0
+    rtsp_auto_analysis_enabled: bool = False
+    rtsp_auto_analysis_mode: Optional[str] = None
+    point_cloud_enabled: bool = True
+
+
+class PointCloudSettingsRequest(BaseModel):
+    point_cloud_enabled: bool
+
+
+class PointCloudSettingsResponse(BaseModel):
+    point_cloud_enabled: bool
 
 
 class RuntimeResetResponse(BaseModel):
     status: str
     removed_project_dirs: int
     removed_bytes: int
+
+
+class RtspRecordingsClearResponse(BaseModel):
+    status: str
+    deleted_files: int
+    freed_bytes: int
+
+
+class RtspWatchSettingsResponse(BaseModel):
+    test_mode: bool
+    test_max_seconds: float
+
+
+class RtspWatchSettingsRequest(BaseModel):
+    test_mode: bool
+
+
+class RtspPlaybackStateResponse(BaseModel):
+    rtsp_url: str
+    storage_key: str
+    recording_active: bool
+    stream_online: bool = False
+    live_url: str
+    live_video_start_ts: Optional[int] = None
+    recorded_video_url: Optional[str] = None
+    recorded_video_start_ts: Optional[int] = None
 
 
 class SceneRebuildResponse(BaseModel):
@@ -89,11 +144,17 @@ class ProjectSummary(BaseModel):
     time_offset_ms: Optional[int]
     scene_url: Optional[str]
     inspection_video_url: Optional[str]
+    rtsp_live_url: Optional[str] = None
+    rtsp_recording_active: bool = False
+    rtsp_stream_online: bool = False
+    rtsp_recorded_video_url: Optional[str] = None
     available_scene_sources: list[Literal["lidar", "sfm"]] = Field(default_factory=lambda: ["lidar"])
     default_scene_source: Literal["lidar", "sfm"] = "lidar"
     sfm_available: bool = False
     provider_available: bool = False
-    analysis_mode: Optional[Literal["demo", "provider"]] = None
+    yolo_available: bool = False
+    provider_yolo_available: bool = False
+    analysis_mode: Optional[Literal["demo", "provider", "provider_yolo", "provider_yolo_monitor"]] = None
     analysis_provider: Optional[str] = None
     analysis_model: Optional[str] = None
     analysis_notes: list[str] = Field(default_factory=list)

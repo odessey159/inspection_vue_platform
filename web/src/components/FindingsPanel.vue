@@ -114,7 +114,7 @@ const filteredFindings = computed(() => {
         </div>
 
         <h3>{{ finding.title }}</h3>
-        <p>{{ finding.hazard_desc }}</p>
+        <p class="finding-card-summary">{{ finding.description || finding.hazard_desc }}</p>
 
         <div class="finding-meta">
           <span>{{ formatRelativeSeconds(project, finding.time_start_ms) }} - {{ formatRelativeSeconds(project, finding.time_end_ms) }}</span>

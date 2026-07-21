@@ -35,3 +35,5 @@ inputs/*
 !inputs/standards/
 inputs/standards/*
 !inputs/standards/.gitkeep
+backend/models/**/*.pt
+!backend/models/YOLO/.gitkeep

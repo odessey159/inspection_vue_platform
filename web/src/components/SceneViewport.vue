@@ -77,6 +77,7 @@ interface CameraTransition {
 const props = defineProps<{
   sceneData: SceneResponse | null;
   selectedFindingId: number | null;
+  activeTimestampMs?: number | null;
 }>();
 
 const emit = defineEmits<{
@@ -116,6 +117,8 @@ let edlQuad: THREE.Mesh | null = null;
 const edlAvailable = ref(true);
 let selectableMeshes: THREE.Mesh[] = [];
 let zoneVisuals: ZoneVisual[] = [];
+let playbackMarker: THREE.Mesh | null = null;
+let cachedSceneMetrics: { min: THREE.Vector3; max: THREE.Vector3; center: THREE.Vector3; span: number } | null = null;
 let animationId = 0;
 let transition: CameraTransition | null = null;
 let resizeObserver: ResizeObserver | null = null;
@@ -1237,6 +1240,8 @@ function disposeEdlResources() {
 function clearDynamic() {
   selectableMeshes = [];
   zoneVisuals = [];
+  playbackMarker = null;
+  cachedSceneMetrics = null;
   if (!stage || !dynamicGroup) {
     return;
   }
@@ -1269,6 +1274,7 @@ function rebuildSceneGraph(reframeCamera: boolean) {
   try {
     const selection = getPointSelection(props.sceneData);
     const { min, center, span } = getSceneMetrics(props.sceneData);
+    cachedSceneMetrics = { min: min.clone(), max: selection.bounds.max ? new THREE.Vector3(...selection.bounds.max) : min.clone(), center: center.clone(), span };
 
     const ground = new THREE.Mesh(
       new THREE.PlaneGeometry(span * 1.95, span * 1.95),
@@ -1290,6 +1296,7 @@ function rebuildSceneGraph(reframeCamera: boolean) {
     if (showPathPoints.value) {
       buildTrajectoryPoints(props.sceneData, min.z, span);
     }
+    updatePlaybackMarker();
 
     if (reframeCamera) {
       startAutoFocus(true);
@@ -1686,6 +1693,65 @@ function applyZoneSelection() {
   });
 }
 
+function updatePlaybackMarker() {
+  if (!dynamicGroup || !props.sceneData || !showPathPoints.value) {
+    if (playbackMarker) {
+      playbackMarker.visible = false;
+    }
+    return;
+  }
+
+  const timestamp = props.activeTimestampMs;
+  if (timestamp === null || timestamp === undefined || !Number.isFinite(timestamp)) {
+    if (playbackMarker) {
+      playbackMarker.visible = false;
+    }
+    return;
+  }
+
+  const index = nearestTrajectoryIndexByTimestamp(props.sceneData, timestamp);
+  const point = index >= 0 ? props.sceneData.trajectory[index] : null;
+  if (!point) {
+    if (playbackMarker) {
+      playbackMarker.visible = false;
+    }
+    return;
+  }
+
+  // Reuse cached metrics from rebuild; recompute only when unavailable.
+  const metrics = cachedSceneMetrics ?? getSceneMetrics(props.sceneData);
+  if (!cachedSceneMetrics) {
+    cachedSceneMetrics = {
+      min: metrics.min.clone(),
+      max: metrics.max.clone(),
+      center: metrics.center.clone(),
+      span: metrics.span,
+    };
+  }
+
+  const zLift = clamp(metrics.span * 0.006, 0.14, 0.32);
+  const radius = clamp(metrics.span * 0.0035, 0.09, 0.22);
+
+  if (!playbackMarker) {
+    playbackMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 14, 14),
+      new THREE.MeshBasicMaterial({
+        color: "#ffd166",
+        transparent: true,
+        opacity: 0.95,
+        depthTest: true,
+        depthWrite: false,
+      }),
+    );
+    playbackMarker.renderOrder = 8;
+    dynamicGroup.add(playbackMarker);
+  }
+
+  playbackMarker.visible = true;
+  playbackMarker.scale.setScalar(radius);
+  playbackMarker.position.set(point[0], point[1], Math.max(point[2], metrics.min.z) + zLift + radius * 1.2);
+}
+
 function startAutoFocus(immediate = false) {
   if (!props.sceneData || !camera || !controls) {
     return;
@@ -1891,6 +1957,9 @@ watch(() => props.selectedFindingId, () => {
       focusTrajectoryIndex(trajectoryIndex);
     }
   }
+});
+watch(() => props.activeTimestampMs, () => {
+  updatePlaybackMarker();
 });
 
 onBeforeUnmount(() => {

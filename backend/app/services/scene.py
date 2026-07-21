@@ -352,6 +352,116 @@ def build_scene(
     return payload
 
 
+def build_scene_from_pcd(pcd_path: Path, output_path: Path) -> dict[str, object]:
+    """Build a frontend-ready scene.json from a single world-frame PCD map."""
+    pcd_path = pcd_path.resolve()
+    if not pcd_path.is_file():
+        raise FileNotFoundError(f"PCD file not found: {pcd_path}")
+
+    raw_points = load_point_rows(pcd_path)
+    if raw_points.size == 0:
+        raise ValueError(f"PCD file contains no points: {pcd_path}")
+
+    voxel_map: dict[tuple[int, int, int], list[float]] = {}
+    _accumulate_world_points(voxel_map, raw_points[:, :3], raw_points[:, 3], None, None)
+    if not voxel_map:
+        raise ValueError(f"No usable points after voxelization: {pcd_path}")
+
+    full_candidates = _trim_vertical_outliers(_finalize_voxels(voxel_map))
+    if not full_candidates:
+        raise ValueError("The point cloud became empty after outlier trimming")
+
+    roof_threshold, roof_context = _roof_threshold(full_candidates)
+    roof_candidates = [point for point in full_candidates if point.z <= roof_threshold]
+    roof_source = roof_candidates or full_candidates
+    floor_threshold, floor_context = _floor_threshold(roof_source)
+    floor_candidates = [point for point in roof_source if point.z >= floor_threshold]
+    active_source = floor_candidates if len(floor_candidates) >= max(2000, int(len(roof_source) * 0.2)) else roof_source
+    floor_cut_applied = active_source is floor_candidates
+    default_point_mode = DEFAULT_POINT_MODE if roof_candidates else "full"
+
+    center = [
+        float(sum(point.x for point in roof_source) / len(roof_source)),
+        float(sum(point.y for point in roof_source) / len(roof_source)),
+        float(sum(point.z for point in roof_source) / len(roof_source)),
+    ]
+    trajectory = [center, center]
+    trajectory_timestamps = [0, 0]
+    trajectory_orientations = [[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]]
+
+    full_points = _serialize_points(_select_points(full_candidates, trajectory, max_points=SCENE_MAX_POINTS))
+    roof_removed_points = _serialize_points(_select_points(roof_source, trajectory, max_points=SCENE_MAX_POINTS))
+    floor_removed_points = _serialize_points(_select_points(active_source, trajectory, max_points=SCENE_MAX_POINTS))
+    structure_cloud, render_voxel_size = _build_structure_points(roof_source, trajectory)
+    structure_points = _serialize_points(structure_cloud)
+    render_points = structure_points
+    active_points = roof_removed_points if roof_removed_points else full_points
+
+    roof_cut_height = round(float(min(roof_threshold, _max_z(active_source))), 4)
+    floor_cut_height = round(float(floor_threshold), 4)
+    input_point_count = int(raw_points.shape[0])
+
+    payload = {
+        "points": active_points,
+        "full_points": full_points,
+        "roof_removed_points": roof_removed_points,
+        "floor_removed_points": floor_removed_points,
+        "structure_points": structure_points,
+        "render_points": render_points,
+        "default_point_mode": default_point_mode,
+        "trajectory": trajectory,
+        "trajectory_timestamps": trajectory_timestamps,
+        "trajectory_orientations": trajectory_orientations,
+        "bounds": _compute_bounds(roof_source, trajectory),
+        "full_bounds": _compute_bounds(full_candidates, trajectory),
+        "roof_removed_bounds": _compute_bounds(roof_source, trajectory),
+        "source_frame_count": 1,
+        "coordinate_frame": "global",
+        "source_type": "static_pcd_map",
+        "raw_point_count": len(roof_source),
+        "render_point_count": len(render_points),
+        "structure_point_count": len(structure_points),
+        "colorized": False,
+        "color_source": "lidar_intensity_structure",
+        "cut_height_default": roof_cut_height,
+        "floor_cut_default": floor_cut_height,
+        "scene_source": "lidar",
+        "reconstruction_method": "static_pcd",
+        "scene_quality": {
+            "base_voxel_size_m": SCENE_VOXEL_SIZE,
+            "structure_voxel_size_m": round(render_voxel_size, 4),
+            "roof_cut_height_m": roof_cut_height,
+            "floor_cut_height_m": floor_cut_height,
+            "input_frame_count": 1,
+            "input_point_count": input_point_count,
+            "used_frame_count": 1,
+            "source_pcd": str(pcd_path),
+            "full_candidate_count": len(full_candidates),
+            "roof_removed_count": len(roof_source),
+            "floor_removed_count": len(active_source),
+            "structure_point_count": len(structure_points),
+            "render_point_count": len(render_points),
+            "frontend_default_source": "roof_removed" if roof_removed_points else "full",
+            "frontend_default_point_count": len(active_points),
+        },
+        "selected_image_count": 0,
+        "registered_image_count": 0,
+        "alignment_status": "not_applicable",
+        "alignment_rmse_m": None,
+        "notes": [
+            f"Built scene from static PCD map: {pcd_path.name}.",
+            f"Loaded {input_point_count} raw points; voxelized to {len(full_candidates)} candidates.",
+            f"Base voxel size: {SCENE_VOXEL_SIZE} m; structure render voxel size: {render_voxel_size:.3f} m.",
+            f"Roof-off cut height: z={roof_threshold:.2f} m ({roof_context}).",
+            f"Floor-off cut height: z={floor_threshold:.2f} m ({floor_context}; applied={floor_cut_applied}).",
+            f"Structure layer contains {len(structure_points)} display points.",
+            "No trajectory poses were provided; map-center placeholder trajectory is used.",
+        ],
+    }
+    write_json(output_path, payload)
+    return payload
+
+
 def load_point_rows(path: Path) -> np.ndarray:
     suffix = path.suffix.lower()
     if suffix == ".pcd":

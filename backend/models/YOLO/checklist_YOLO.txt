@@ -1,0 +1,21 @@
+| ID | 类别名          | 大致含义              
+| -: | -------------- | ----------------- 
+|  0 | `exit`         | 安全出口 / 出口标识       
+|  1 | `forklift`     | 叉车                
+|  2 | `hook`         | 吊钩                
+|  3 | `hookpulley`   | 吊钩滑轮 / 滑轮组        
+|  4 | `extinguisher` | 灭火器               
+|  5 | `powerbox`     | 配电箱 / 电箱          
+|  6 | `firecock`     | 消火栓 / 消防栓         
+|  7 | `dustduct`     | 除尘管道 / 粉尘管道       
+|  8 | `human`        | 人                 
+|  9 | `warning`      | 警示标志              
+| 10 | `sander`       | 砂光机 / 打磨设备        
+| 11 | `dustcover`    | 防尘罩 / 除尘罩         
+| 12 | `dust`         | 粉尘                
+| 13 | `woodmachine`  | 木工机械              
+| 14 | `firedetect`   | 火灾探测器 / 感烟感温探测器   
+| 15 | `dustremover`  | 除尘设备              
+| 16 | `airlock`      | 风锁 / 卸灰阀 / 闭风器    
+| 17 | `planer`       | 刨床 / 刨木机          
+| 18 | `firealarm`    | 火灾报警器 / 报警按钮/报警装置 

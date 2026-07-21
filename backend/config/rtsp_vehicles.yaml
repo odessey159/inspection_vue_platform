@@ -1,0 +1,31 @@
+# Runtime layout (created on backend startup; does not migrate rtsp_recordings/):
+#   .runtime/robots/<id>/recordings/  — recorded videos
+#   .runtime/robots/<id>/maps/        — point-cloud map files
+vehicles:
+  - id: local-demo
+    name: 本地测试巡检车
+    rtsp_url: rtsp://127.0.0.1:18554/live
+  - id: vehicle-02
+    name: 巡检车02
+    rtsp_url: rtsp://127.0.0.1:18554/live
+  - id: vehicle-03
+    name: 巡检车03
+    rtsp_url: rtsp://127.0.0.1:18554/live
+  - id: vehicle-04
+    name: 巡检车04
+    rtsp_url: rtsp://127.0.0.1:18554/live
+  - id: vehicle-05
+    name: 巡检车05
+    rtsp_url: rtsp://127.0.0.1:18554/live
+  - id: vehicle-06
+    name: 巡检车06
+    rtsp_url: rtsp://127.0.0.1:18554/live
+  - id: vehicle-07
+    name: 巡检车07
+    rtsp_url: rtsp://127.0.0.1:18554/live
+  - id: vehicle-08
+    name: 巡检车08
+    rtsp_url: rtsp://127.0.0.1:18554/live
+  - id: vehicle-09
+    name: 巡检车09
+    rtsp_url: rtsp://127.0.0.1:18554/live

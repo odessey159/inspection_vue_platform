@@ -1,4 +1,5 @@
 ﻿import type { AnalysisMode, ProjectSummary } from "../types";
+import { analysisModeLabel, parseAnalysisMode } from "./analysisMode";
 
 const dateTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   year: "numeric",
@@ -81,6 +82,10 @@ export function formatStatusLabel(status: string | null | undefined): string {
       return "已完成预生成";
     case "indexing":
       return "正在导入";
+    case "rtsp_recording":
+      return "正在录制 RTSP";
+    case "rtsp_failed":
+      return "RTSP 录制失败";
     case "demo_analyzed":
       return "Demo 分析完成";
     case "provider_analyzing":
@@ -91,6 +96,8 @@ export function formatStatusLabel(status: string | null | undefined): string {
       return "Provider 分析失败";
     case "analysis_pending_provider":
       return "等待模型分析";
+    case "rebuilt":
+      return "场景已重建";
     case "failed":
       return "导入失败";
     default:
@@ -99,12 +106,12 @@ export function formatStatusLabel(status: string | null | undefined): string {
 }
 
 export function formatAnalysisMode(mode: AnalysisMode | string | null | undefined): string {
-  switch (mode) {
-    case "provider":
-      return "Provider";
-    case "demo":
-      return "Demo";
-    default:
-      return "--";
+  const parsed = parseAnalysisMode(typeof mode === "string" ? mode : null);
+  if (parsed) {
+    return analysisModeLabel(parsed);
   }
+  if (mode === "demo") {
+    return "Demo";
+  }
+  return "--";
 }

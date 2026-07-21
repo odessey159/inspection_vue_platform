@@ -1,21 +1,65 @@
 export type ReviewStatus = "pending" | "confirmed" | "rejected";
-export type AnalysisMode = "demo" | "provider";
+export type AnalysisMode = "demo" | "provider" | "provider_yolo" | "provider_yolo_monitor";
 export type SceneSource = "lidar" | "sfm";
+
+export interface RtspVehicle {
+  id: string;
+  name: string;
+  rtsp_url: string;
+}
 
 export interface BootstrapResponse {
   sample_bag_dir: string | null;
+  sample_scene_path?: string | null;
+  sample_pcd_path?: string | null;
   sample_standards_dir: string | null;
+  default_rtsp_url: string;
+  default_rtsp_record_seconds: number;
+  rtsp_vehicles: RtspVehicle[];
   detected_bag_dirs: string[];
   detected_standards_dirs: string[];
   provider_available: boolean;
+  yolo_available: boolean;
+  provider_yolo_available: boolean;
   default_analysis_model: string | null;
   supported_analysis_models: string[];
+  rtsp_watch_test_mode: boolean;
+  rtsp_watch_test_max_seconds: number;
+  rtsp_auto_analysis_enabled?: boolean;
+  rtsp_auto_analysis_mode?: string | null;
+  point_cloud_enabled?: boolean;
+}
+
+export interface PointCloudSettingsResponse {
+  point_cloud_enabled: boolean;
 }
 
 export interface RuntimeResetResponse {
   status: string;
   removed_project_dirs: number;
   removed_bytes: number;
+}
+
+export interface RtspRecordingsClearResponse {
+  status: string;
+  deleted_files: number;
+  freed_bytes: number;
+}
+
+export interface RtspWatchSettingsResponse {
+  test_mode: boolean;
+  test_max_seconds: number;
+}
+
+export interface RtspPlaybackState {
+  rtsp_url: string;
+  storage_key: string;
+  recording_active: boolean;
+  stream_online: boolean;
+  live_url: string;
+  live_video_start_ts: number | null;
+  recorded_video_url: string | null;
+  recorded_video_start_ts: number | null;
 }
 
 export interface SceneRebuildResponse {
@@ -41,6 +85,8 @@ export interface ImageSceneRebuildResponse {
   alignment_rmse_m: number | null;
   notes: string[];
 }
+
+export type RtspPlaybackMode = "live" | "recorded" | "artifact" | "empty";
 
 export interface ProjectSummary {
   id: number;
@@ -68,10 +114,16 @@ export interface ProjectSummary {
   time_offset_ms: number | null;
   scene_url: string | null;
   inspection_video_url: string | null;
+  rtsp_live_url: string | null;
+  rtsp_recording_active: boolean;
+  rtsp_stream_online?: boolean;
+  rtsp_recorded_video_url: string | null;
   available_scene_sources: SceneSource[];
   default_scene_source: SceneSource;
   sfm_available: boolean;
   provider_available: boolean;
+  yolo_available: boolean;
+  provider_yolo_available: boolean;
   analysis_mode: AnalysisMode | null;
   analysis_provider: string | null;
   analysis_model: string | null;
@@ -187,4 +239,6 @@ export interface ProjectImportPayload {
   name: string;
   bag_dir: string;
   standards_dir: string;
+  rtsp_duration_sec?: number | null;
+  rtsp_transport?: "tcp" | "udp" | null;
 }

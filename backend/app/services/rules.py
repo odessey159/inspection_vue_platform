@@ -84,6 +84,12 @@ def export_rules_payload(rules: list[HazardRule]) -> list[dict[str, object]]:
     ]
 
 
+def sync_rules_to_db(rules: list[HazardRule]) -> None:
+    from .rule_db import upsert_rules_to_db
+
+    upsert_rules_to_db(export_rules_payload(rules))
+
+
 def _parse_excel_rules(standards_dir: Path, project_id: int) -> list[HazardRule]:
     xlsx_files = sorted(standards_dir.glob("*.xlsx"))
     if not xlsx_files:

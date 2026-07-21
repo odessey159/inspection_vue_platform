@@ -1,6 +1,10 @@
+import runpy
 import unittest
+from pathlib import Path
 
 import numpy as np
+
+runpy.run_path(str(Path(__file__).with_name("_bootstrap.py")))
 
 from app.services.scene import CloudPoint, EgoArtifactFilter, Transform3D, _filter_ego_artifacts, _filter_trajectory_sweep_artifacts
 

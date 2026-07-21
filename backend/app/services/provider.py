@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from ..models import HazardRule, Project
 from ..settings import (
+    CLIP_COMPRESS_TIMEOUT_SECONDS,
     FFMPEG_BIN,
     VISION_API_KEY,
     VISION_API_URL,
@@ -29,6 +30,7 @@ from ..settings import (
     resolve_vision_model,
 )
 from .analysis_types import AnalysisRunResult, FindingSeed
+from .llm_output_log import write_llm_log
 from .storage import read_json, remove_paths
 
 
@@ -69,7 +71,16 @@ def provider_label() -> str:
 
 
 
-def run_provider_analysis(project: Project, rules: list[HazardRule], model_override: str | None = None) -> AnalysisRunResult:
+def run_provider_analysis(
+    project: Project,
+    rules: list[HazardRule],
+    model_override: str | None = None,
+    *,
+    video_path: Path | None = None,
+    video_start_ts: int | None = None,
+    video_end_ts: int | None = None,
+    video_label: str = "primary",
+) -> AnalysisRunResult:
     diagnostics: list[str] = []
     notes: list[str] = []
     selected_model = resolve_vision_model(model_override)
@@ -83,41 +94,48 @@ def run_provider_analysis(project: Project, rules: list[HazardRule], model_overr
     if not is_supported_vision_model(selected_model):
         diagnostics.append(f"Model is not in the configured supported list: {selected_model}")
         return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)
-    if not project.inspection_video_path:
+
+    resolved_video_path = video_path or (Path(project.inspection_video_path) if project.inspection_video_path else None)
+    if resolved_video_path is None:
         diagnostics.append("Project video is missing")
         return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)
-
-    video_path = Path(project.inspection_video_path)
-    if not video_path.exists():
-        diagnostics.append(f"Project video not found: {video_path}")
+    if not resolved_video_path.exists():
+        diagnostics.append(f"Project video not found: {resolved_video_path}")
         return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)
 
-    dataset_summary_path = Path(project.artifacts_dir) / "summaries" / "dataset_summary.json"
-    if not dataset_summary_path.exists():
-        diagnostics.append("Dataset summary is missing")
-        return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)
+    if video_start_ts is not None and video_end_ts is not None:
+        resolved_video_start_ts = video_start_ts
+        resolved_video_end_ts = video_end_ts
+    else:
+        dataset_summary_path = Path(project.artifacts_dir) / "summaries" / "dataset_summary.json"
+        if not dataset_summary_path.exists():
+            diagnostics.append("Dataset summary is missing")
+            return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)
+        dataset_summary = read_json(dataset_summary_path)
+        resolved_video_start_ts = int(dataset_summary.get("video_start_ts") or project.bag_start_ts or 0)
+        resolved_video_end_ts = int(dataset_summary.get("video_end_ts") or project.bag_end_ts or resolved_video_start_ts)
 
-    dataset_summary = read_json(dataset_summary_path)
-    video_start_ts = int(dataset_summary.get("video_start_ts") or project.bag_start_ts or 0)
-    video_end_ts = int(dataset_summary.get("video_end_ts") or project.bag_end_ts or video_start_ts)
-    if video_end_ts <= video_start_ts:
+    if resolved_video_end_ts <= resolved_video_start_ts:
         diagnostics.append("Video timestamps are invalid; cannot prepare provider clips")
         return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)
 
-    clip_dir = Path(project.artifacts_dir) / "artifacts" / "analysis_clips"
+    clip_dir = Path(project.artifacts_dir) / "artifacts" / "analysis_clips" / video_label
     clip_dir.mkdir(parents=True, exist_ok=True)
     remove_paths(list(clip_dir.glob("clip_*.mp4")))
 
     prepared_clips, clip_diagnostics = _prepare_clips(
-        video_path=video_path,
+        video_path=resolved_video_path,
         clip_dir=clip_dir,
-        video_start_ts=video_start_ts,
-        video_end_ts=video_end_ts,
+        video_start_ts=resolved_video_start_ts,
+        video_end_ts=resolved_video_end_ts,
     )
     diagnostics.extend(clip_diagnostics)
     if not prepared_clips:
         diagnostics.append("No provider clips were prepared successfully")
         return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)
+
+    if video_label != "primary":
+        notes.append(f"Analyzing RTSP video target `{video_label}` at {resolved_video_path.name}.")
 
     rules_by_id = {rule.rule_id: rule for rule in rules}
     seeds: list[FindingSeed] = []
@@ -231,7 +249,12 @@ def _compress_clip(
             "+faststart",
             str(output_path),
         ]
-        result = subprocess.run(command, capture_output=True, text=True)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=CLIP_COMPRESS_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            remove_paths([output_path])
+            last_error = f"ffmpeg clip compression timed out after {CLIP_COMPRESS_TIMEOUT_SECONDS}s"
+            continue
         if result.returncode != 0:
             remove_paths([output_path])
             last_error = result.stderr.strip() or "ffmpeg clip preparation failed"
@@ -262,7 +285,14 @@ def _compress_clip(
 
 
 
-def _invoke_dashscope(*, clip: PreparedClip, rules: list[HazardRule], selected_model: str) -> ProviderResponsePayload:
+def _invoke_dashscope(
+    *,
+    clip: PreparedClip,
+    rules: list[HazardRule],
+    selected_model: str,
+    extra_context: str = "",
+    retrieved_rules: bool = False,
+) -> ProviderResponsePayload:
     video_bytes = clip.path.read_bytes()
     if len(video_bytes) > VISION_MAX_CLIP_BYTES:
         raise RuntimeError(
@@ -280,12 +310,16 @@ def _invoke_dashscope(*, clip: PreparedClip, rules: list[HazardRule], selected_m
         "messages": [
             {
                 "role": "system",
-                "content": "You are a strict industrial safety video reviewer. Only use the listed rule_id values. Return valid JSON only.",
+                "content": (
+                    "You are an industrial safety video reviewer. "
+                    "Report hazards supported by the video and/or YOLO detections. "
+                    "Only use the listed rule_id values. Return valid JSON only."
+                ),
             },
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": _build_prompt(clip=clip, rules=rules)},
+                    {"type": "text", "text": _build_prompt(clip=clip, rules=rules, extra_context=extra_context, retrieved_rules=retrieved_rules)},
                     {
                         "type": "video_url",
                         "video_url": {"url": f"data:video/mp4;base64,{encoded_video}"},
@@ -312,7 +346,32 @@ def _invoke_dashscope(*, clip: PreparedClip, rules: list[HazardRule], selected_m
             )
             with request.urlopen(req, timeout=VISION_REQUEST_TIMEOUT_SECONDS) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-            return _parse_provider_payload(payload)
+            parsed = _parse_provider_payload(payload)
+            message = {}
+            choices = payload.get("choices") if isinstance(payload, dict) else None
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                maybe_message = choices[0].get("message")
+                if isinstance(maybe_message, dict):
+                    message = maybe_message
+            write_llm_log(
+                source="batch_clip",
+                clip_index=f"clip-{clip.index:02d}",
+                model=selected_model,
+                raw_response=message.get("content", payload),
+                parsed_payload=parsed,
+                notes=list(parsed.notes),
+                prompt_section=extra_context,
+                extra={
+                    "clip_index": clip.index,
+                    "clip_start_offset_sec": clip.start_offset_sec,
+                    "clip_duration_sec": clip.duration_sec,
+                    "clip_byte_size": clip.byte_size,
+                    "retrieved_rules": retrieved_rules,
+                    "findings": len(parsed.findings),
+                    "attempt": attempt,
+                },
+            )
+            return parsed
         except error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
             last_error = RuntimeError(f"HTTP {exc.code}: {detail or exc.reason}")
@@ -325,27 +384,81 @@ def _invoke_dashscope(*, clip: PreparedClip, rules: list[HazardRule], selected_m
                 continue
             break
 
+    try:
+        write_llm_log(
+            source="batch_clip",
+            clip_index=f"clip-{clip.index:02d}",
+            model=selected_model,
+            raw_response="",
+            parsed_payload=None,
+            notes=[],
+            diagnostics=[str(last_error) if last_error else "DashScope request failed"],
+            prompt_section=extra_context,
+            extra={
+                "clip_index": clip.index,
+                "clip_start_offset_sec": clip.start_offset_sec,
+                "clip_duration_sec": clip.duration_sec,
+                "clip_byte_size": clip.byte_size,
+                "retrieved_rules": retrieved_rules,
+                "error": str(last_error) if last_error else "DashScope request failed",
+            },
+        )
+    except Exception:
+        pass
     raise RuntimeError(str(last_error) if last_error else "DashScope request failed")
 
 
 
-def _build_prompt(*, clip: PreparedClip, rules: list[HazardRule]) -> str:
+def _build_prompt(*, clip: PreparedClip, rules: list[HazardRule], extra_context: str = "", retrieved_rules: bool = False) -> str:
     rule_lines = "\n".join(_compact_rule_line(rule) for rule in rules)
-    return (
-        "Inspect this industrial inspection video clip and identify only clearly visible hazards.\n"
+    if retrieved_rules:
+        rules_section = (
+            "Retrieved Rules:\n"
+            "The following rules were retrieved from the inspection rule database based on YOLO detections and clip context.\n"
+            "Only use these rule_id values.\n"
+            f"{rule_lines}\n"
+        )
+        extra_constraints = (
+            "- Retrieved rules and YOLO detections are strong candidate hints.\n"
+            "- Report a finding when YOLO and/or the video support the retrieved rule.\n"
+        )
+    else:
+        rules_section = f"Rules:\n{rule_lines}\n"
+        extra_constraints = ""
+
+    prompt = (
+        "Inspect this industrial inspection video clip and identify safety hazards that match the listed rules.\n"
         f"Clip start offset: {clip.start_offset_sec:.1f}s\n"
         f"Clip duration: {clip.duration_sec:.1f}s\n"
         f"Maximum findings to return: {VISION_MAX_FINDINGS_PER_CLIP}\n"
         "Return exactly one JSON object with this shape:\n"
         '{"findings":[{"rule_id":"rule-001","start_offset_sec":1.2,"end_offset_sec":4.8,"evidence_sec":[2.0,4.0],"description":"what is visible","confidence":0.84}],"notes":["optional short notes"]}\n'
-        "Rules:\n"
-        f"{rule_lines}\n"
+        f"{rules_section}"
         "Constraints:\n"
         "- Use only the listed rule_id values.\n"
         "- Offsets must be relative to this clip, not the full video.\n"
-        "- Do not guess when evidence is weak.\n"
-        "- If there is no visible hazard, return {\"findings\":[],\"notes\":[]}"
+        "- Prefer reporting a finding when YOLO detections and/or the video support a listed rule "
+        "(typical object→rule mappings: sander/woodmachine/planer/rotating parts → rule-021; "
+        "dust/dustcover/dustduct → rule-104; exit/passage blockage → rule-056; "
+        "missing no-smoking signs near combustibles → rule-053).\n"
+        "- Do not invent hazards with zero support from video or YOLO.\n"
+        f"{extra_constraints}"
+        "- Return {\"findings\":[],\"notes\":[...]} only when neither the video nor YOLO detections "
+        "indicate any listed hazard in this clip."
     )
+    context = extra_context.strip()
+    if context:
+        prompt += (
+            "\n\n"
+            "=== YOLO pre-analysis context (append to the same user message as the video) ===\n"
+            f"{context}\n"
+            "=== End YOLO context ===\n"
+            "Use YOLO detections together with the attached video. "
+            "When YOLO already flags relevant objects, actively check the correlated rules and "
+            "report findings if the clip is consistent with those hazards — do not discard them "
+            "only because evidence is partially occluded or slightly blurry."
+        )
+    return prompt
 
 
 

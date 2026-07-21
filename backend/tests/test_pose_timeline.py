@@ -1,5 +1,9 @@
 import math
+import runpy
 import unittest
+from pathlib import Path
+
+runpy.run_path(str(Path(__file__).with_name("_bootstrap.py")))
 
 from app.services.dataset import PoseRecord, PoseTimeline
 from app.services.scene import _resolve_pose_validity_window

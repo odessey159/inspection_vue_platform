@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
 from sqlmodel import Session, select
 
 from ..db import get_session
@@ -15,9 +16,15 @@ from ..schemas import (
     BootstrapResponse,
     FindingResponse,
     ImageSceneRebuildResponse,
+    PointCloudSettingsRequest,
+    PointCloudSettingsResponse,
     ProjectImportRequest,
     ProjectSummary,
     RuntimeResetResponse,
+    RtspPlaybackStateResponse,
+    RtspRecordingsClearResponse,
+    RtspWatchSettingsRequest,
+    RtspWatchSettingsResponse,
     RuleResponse,
     SceneRebuildResponse,
     SceneResponse,
@@ -26,9 +33,27 @@ from ..schemas import (
 from ..services.analysis import run_analysis
 from ..services.analysis_summary import read_analysis_summary
 from ..services.evidence import cached_frame_path
-from ..services.import_pipeline import bootstrap_paths, import_project, list_projects, project_runtime_paths
+from ..services.import_pipeline import bootstrap_paths, import_project, list_projects, project_runtime_paths, resolve_inspection_video_url
 from ..services.provider import provider_available
+from ..services.provider_YOLO import provider_yolo_available, yolo_available
 from ..services.runtime import reset_runtime_storage
+from ..services.rtsp_recorder import (
+    build_rtsp_playback_state,
+    clear_rtsp_recordings,
+    find_latest_completed_recording_for_storage_key,
+    import_rtsp_project,
+    is_rtsp_project,
+    maybe_upgrade_rtsp_placeholder_scene,
+    summarize_rtsp_playback_fields,
+)
+from ..services.rtsp_vehicles import (
+    is_point_cloud_enabled,
+    point_cloud_settings_payload,
+    set_point_cloud_enabled,
+)
+from ..services.rtsp_watchdog import rtsp_watch_settings_payload, set_rtsp_watch_test_mode
+from ..services.rtsp_yolo_monitor import start_rtsp_yolo_monitor, stop_rtsp_yolo_monitor
+from ..services.rtsp_live import MJPEG_BOUNDARY, iter_mjpeg_multipart_frames
 from ..services.scene_rebuild import rebuild_project_scene
 from ..services.sfm_reconstruction import rebuild_project_sfm_scene, sfm_scene_exists, sfm_scene_path
 from ..services.storage import read_json, resolve_project_path
@@ -47,6 +72,77 @@ def delete_runtime() -> RuntimeResetResponse:
     return RuntimeResetResponse(**reset_runtime_storage())
 
 
+@router.delete("/rtsp-recordings", response_model=RtspRecordingsClearResponse)
+def delete_rtsp_recordings() -> RtspRecordingsClearResponse:
+    return RtspRecordingsClearResponse(**clear_rtsp_recordings())
+
+
+@router.get("/rtsp-watch-settings", response_model=RtspWatchSettingsResponse)
+def get_rtsp_watch_settings() -> RtspWatchSettingsResponse:
+    return RtspWatchSettingsResponse(**rtsp_watch_settings_payload())
+
+
+@router.patch("/rtsp-watch-settings", response_model=RtspWatchSettingsResponse)
+def patch_rtsp_watch_settings(payload: RtspWatchSettingsRequest) -> RtspWatchSettingsResponse:
+    set_rtsp_watch_test_mode(payload.test_mode)
+    return RtspWatchSettingsResponse(**rtsp_watch_settings_payload())
+
+
+@router.get("/point-cloud-settings", response_model=PointCloudSettingsResponse)
+def get_point_cloud_settings() -> PointCloudSettingsResponse:
+    return PointCloudSettingsResponse(**point_cloud_settings_payload())
+
+
+@router.patch("/point-cloud-settings", response_model=PointCloudSettingsResponse)
+def patch_point_cloud_settings(payload: PointCloudSettingsRequest) -> PointCloudSettingsResponse:
+    set_point_cloud_enabled(payload.point_cloud_enabled)
+    return PointCloudSettingsResponse(**point_cloud_settings_payload())
+
+
+@router.get("/rtsp-playback-state", response_model=RtspPlaybackStateResponse)
+def get_rtsp_playback_state(
+    rtsp_url: str = Query(..., min_length=1),
+    project_id: int | None = Query(default=None),
+) -> RtspPlaybackStateResponse:
+    try:
+        payload = build_rtsp_playback_state(rtsp_url, project_id=project_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if bool(payload.get("stream_online")):
+        start_rtsp_yolo_monitor(str(payload["storage_key"]), str(payload["rtsp_url"]))
+    else:
+        stop_rtsp_yolo_monitor(str(payload["storage_key"]))
+    return RtspPlaybackStateResponse(**payload)
+
+
+@router.get("/rtsp-live")
+def stream_rtsp_live(rtsp_url: str = Query(..., min_length=1)) -> StreamingResponse:
+    try:
+        frame_iter = iter_mjpeg_multipart_frames(rtsp_url.strip())
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return StreamingResponse(
+        iterate_in_threadpool(frame_iter),
+        media_type=f"multipart/x-mixed-replace; boundary={MJPEG_BOUNDARY}",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/rtsp-recordings/{storage_key}/latest")
+def get_latest_rtsp_recording(storage_key: str) -> FileResponse:
+    if not storage_key or storage_key in {".", ".."} or "/" in storage_key or "\\" in storage_key:
+        raise HTTPException(status_code=400, detail="Invalid storage key")
+    recording_path = find_latest_completed_recording_for_storage_key(storage_key)
+    if recording_path is None:
+        raise HTTPException(status_code=404, detail="RTSP recording not found")
+    return FileResponse(recording_path, media_type="video/mp4", filename=recording_path.name)
+
+
 @router.get("/projects", response_model=list[ProjectSummary])
 def get_projects(session: Session = Depends(get_session)) -> list[ProjectSummary]:
     return [_project_summary(project) for project in list_projects(session)]
@@ -55,12 +151,23 @@ def get_projects(session: Session = Depends(get_session)) -> list[ProjectSummary
 @router.post("/projects/import", response_model=ProjectSummary)
 def post_import_project(payload: ProjectImportRequest, session: Session = Depends(get_session)) -> ProjectSummary:
     try:
-        project = import_project(
-            session=session,
-            name=payload.name,
-            bag_dir=Path(payload.bag_dir),
-            standards_dir=Path(payload.standards_dir),
-        )
+        source = payload.bag_dir.strip()
+        if source.lower().startswith("rtsp://"):
+            project = import_rtsp_project(
+                session=session,
+                name=payload.name,
+                rtsp_url=source,
+                standards_dir=Path(payload.standards_dir),
+                duration_sec=payload.rtsp_duration_sec or 60,
+                rtsp_transport=payload.rtsp_transport or "tcp",
+            )
+        else:
+            project = import_project(
+                session=session,
+                name=payload.name,
+                bag_dir=Path(source),
+                standards_dir=Path(payload.standards_dir),
+            )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _project_summary(project)
@@ -80,7 +187,13 @@ def analyze_project(project_id: int, payload: AnalyzeRequest, session: Session =
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     try:
-        findings = run_analysis(session, project, mode=payload.mode, model=payload.model)
+        findings = run_analysis(
+            session,
+            project,
+            mode=payload.mode,
+            model=payload.model,
+            record_fresh_rtsp=payload.record_fresh_rtsp,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return [_finding_response(session, finding) for finding in findings]
@@ -118,6 +231,8 @@ def get_scene(
     if scene_path is None or not scene_path.exists():
         raise HTTPException(status_code=404, detail="Project scene not found")
     payload = read_json(scene_path)
+    if source == "lidar":
+        payload = maybe_upgrade_rtsp_placeholder_scene(project, scene_path, payload)
     zones = list(session.exec(select(HazardZone).where(HazardZone.project_id == project_id)))
     return SceneResponse(
         project_id=project_id,
@@ -218,13 +333,46 @@ def get_video_frame(project_id: int, timestamp_ms: int, session: Session = Depen
     return FileResponse(frame_path)
 
 
+@router.get("/projects/{project_id}/rtsp-live")
+def stream_project_rtsp_live(project_id: int, session: Session = Depends(get_session)) -> StreamingResponse:
+    project = session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not is_rtsp_project(project):
+        raise HTTPException(status_code=400, detail="Project is not RTSP-sourced")
+    try:
+        frame_iter = iter_mjpeg_multipart_frames(project.bag_dir.strip())
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return StreamingResponse(
+        iterate_in_threadpool(frame_iter),
+        media_type=f"multipart/x-mixed-replace; boundary={MJPEG_BOUNDARY}",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 def _project_summary(project: Project) -> ProjectSummary:
     runtime_paths = project_runtime_paths(project)
     dataset_summary = read_json(runtime_paths["dataset_summary"]) if runtime_paths["dataset_summary"].exists() else {}
     analysis_summary = read_analysis_summary(project)
     scene_url = f"/api/projects/{project.id}/scene" if project.scene_path else None
-    inspection_video_url = f"/artifacts/{project.id}/artifacts/inspection.mp4" if project.inspection_video_path else None
+    inspection_video_url = resolve_inspection_video_url(project)
+    rtsp_live_url = None
+    rtsp_recording_active = False
+    rtsp_stream_online = False
+    rtsp_recorded_video_url = None
+    if is_rtsp_project(project):
+        playback_state = summarize_rtsp_playback_fields(project.bag_dir.strip(), project_id=project.id)
+        rtsp_live_url = str(playback_state["live_url"])
+        rtsp_recording_active = bool(playback_state["recording_active"])
+        rtsp_stream_online = bool(playback_state.get("stream_online"))
+        recorded_video_url = playback_state.get("recorded_video_url")
+        rtsp_recorded_video_url = str(recorded_video_url) if recorded_video_url else None
     analysis_mode = analysis_summary.get("analysis_mode")
     available_scene_sources = _available_scene_sources(project)
     return ProjectSummary(
@@ -253,11 +401,21 @@ def _project_summary(project: Project) -> ProjectSummary:
         time_offset_ms=project.time_offset_ms,
         scene_url=scene_url,
         inspection_video_url=inspection_video_url,
+        rtsp_live_url=rtsp_live_url,
+        rtsp_recording_active=rtsp_recording_active,
+        rtsp_stream_online=rtsp_stream_online,
+        rtsp_recorded_video_url=rtsp_recorded_video_url,
         available_scene_sources=available_scene_sources,
         default_scene_source="lidar",
         sfm_available="sfm" in available_scene_sources,
         provider_available=provider_available(),
-        analysis_mode=analysis_mode if analysis_mode in {"demo", "provider"} else None,
+        yolo_available=yolo_available(),
+        provider_yolo_available=provider_yolo_available(),
+        analysis_mode=(
+            analysis_mode
+            if analysis_mode in {"demo", "provider", "provider_yolo", "provider_yolo_monitor"}
+            else None
+        ),
         analysis_provider=_safe_str(analysis_summary.get("analysis_provider")),
         analysis_model=_safe_str(analysis_summary.get("analysis_model")),
         analysis_notes=_safe_list_of_str(analysis_summary.get("notes")),

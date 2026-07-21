@@ -8,6 +8,7 @@ from sqlmodel import Session, delete
 from ..db import create_db_and_tables, engine
 from ..models import Finding, HazardRule, HazardZone, Project
 from ..settings import PROJECTS_DIR, RUNTIME_DIR
+from .rtsp_vehicles import ensure_robot_runtime_dirs
 from .storage import path_size_bytes, remove_paths
 
 
@@ -33,10 +34,12 @@ def reset_runtime_storage() -> dict[str, int | str]:
             shutil.rmtree(RUNTIME_DIR)
         RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_robot_runtime_dirs()
         create_db_and_tables()
     except PermissionError:
         remove_paths([PROJECTS_DIR])
         PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_robot_runtime_dirs()
         _clear_database_rows()
         create_db_and_tables()
 

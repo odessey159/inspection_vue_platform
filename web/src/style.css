@@ -263,6 +263,23 @@ button {
   min-width: 250px;
 }
 
+.rtsp-test-toggle {
+  min-width: auto;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(134, 164, 201, 0.16);
+  border-radius: 14px;
+  background: rgba(8, 18, 33, 0.72);
+}
+
+.rtsp-test-toggle input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
 .span-2 {
   grid-column: span 2;
 }
@@ -324,6 +341,140 @@ button {
   margin-top: 12px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.import-intro {
+  margin: 0 0 14px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.import-intro code {
+  color: var(--accent-strong);
+  font-size: 12px;
+}
+
+.vehicle-list {
+  display: grid;
+  gap: 0;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid rgba(134, 164, 201, 0.14);
+  border-radius: 16px;
+  background: rgba(6, 12, 23, 0.52);
+}
+
+.vehicle-list-head,
+.vehicle-list-row {
+  display: grid;
+  grid-template-columns: 56px minmax(120px, 0.9fr) minmax(0, 1.6fr) 72px;
+  align-items: center;
+  gap: 12px;
+  padding: 0 14px;
+}
+
+.vehicle-list-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  min-height: 38px;
+  border-bottom: 1px solid rgba(134, 164, 201, 0.12);
+  background: rgba(8, 18, 34, 0.96);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.vehicle-list-row {
+  width: 100%;
+  min-height: 48px;
+  border: 0;
+  border-bottom: 1px solid rgba(134, 164, 201, 0.08);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.vehicle-list-row:last-child {
+  border-bottom: 0;
+}
+
+.vehicle-list-row:hover:not(:disabled) {
+  background: rgba(95, 183, 255, 0.08);
+}
+
+.vehicle-list-row:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.vehicle-list-index {
+  color: var(--accent-strong);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.vehicle-list-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.vehicle-list-url {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vehicle-list-action {
+  justify-self: end;
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.vehicle-list-row:hover:not(:disabled) .vehicle-list-action {
+  color: var(--text);
+}
+
+.selected-vehicle-banner {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(95, 183, 255, 0.18);
+  border-radius: 16px;
+  background: rgba(95, 183, 255, 0.08);
+}
+
+.selected-vehicle-banner span {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.selected-vehicle-banner strong {
+  font-size: 16px;
+}
+
+.selected-vehicle-banner code {
+  color: var(--text-soft);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.selected-vehicle-banner.rosbag-mode {
+  border-color: rgba(255, 181, 109, 0.18);
+  background: rgba(255, 181, 109, 0.08);
+}
+
+.section-head-actions {
+  margin-top: 0;
 }
 
 .button-row {
@@ -402,6 +553,7 @@ button {
 
 .hint-text,
 .scene-footnote p,
+.analysis-footnote p,
 .video-caption span,
 .finding-card p,
 .detail-copy p,
@@ -443,6 +595,28 @@ button {
   border-radius: 22px;
   border: 1px solid rgba(114, 148, 191, 0.12);
   background: linear-gradient(180deg, rgba(7, 14, 29, 0.82), rgba(4, 9, 18, 0.96));
+}
+
+.scene-live-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: 8px;
+  padding: 32px;
+  text-align: center;
+  color: #9eb6d4;
+}
+
+.scene-live-placeholder p {
+  margin: 0;
+  font-size: 1.05rem;
+  color: #d7e6f7;
+}
+
+.scene-live-placeholder span {
+  font-size: 0.92rem;
+  opacity: 0.82;
 }
 
 .scene-stage,
@@ -641,9 +815,22 @@ button {
   font-size: 12px;
 }
 
+.analysis-footnote {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  font-size: 12px;
+}
+
+.video-panel {
+  /* backdrop-filter on panel ancestors can swallow clicks on native <video controls> in Chromium. */
+  backdrop-filter: none;
+}
+
 .video-frame-shell {
   position: relative;
-  overflow: hidden;
+  isolation: isolate;
+  overflow: visible;
   border-radius: 20px;
   border: 1px solid rgba(112, 145, 188, 0.14);
   background:
@@ -653,9 +840,28 @@ button {
 
 .video-player {
   display: block;
+  position: relative;
+  z-index: 1;
   width: 100%;
   aspect-ratio: 16 / 9;
+  border-radius: 20px;
   background: #050b14;
+  pointer-events: auto;
+  object-fit: contain;
+}
+
+.video-player.live-stream {
+  pointer-events: none;
+}
+
+/* Prefetch MJPEG under recorded playback without covering the video. */
+.video-player.live-stream.live-stream-pending {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 0;
 }
 
 .video-caption {
@@ -669,6 +875,37 @@ button {
 
 .video-caption strong {
   color: var(--text);
+}
+
+.video-status-hint {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 12px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  color: var(--text-soft);
+  background: rgba(5, 13, 25, 0.78);
+  border: 1px solid rgba(129, 166, 214, 0.16);
+  pointer-events: none;
+}
+
+.video-status-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #ffd3bd;
+  border-color: rgba(255, 127, 92, 0.26);
+  background: rgba(67, 22, 15, 0.72);
+  pointer-events: auto;
+}
+
+.video-status-error .ghost-button {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  font-size: 11px;
 }
 
 .timeline-chip-row {
@@ -705,7 +942,6 @@ button {
   border: 1px solid rgba(129, 166, 214, 0.12);
   cursor: pointer;
   transition:
-    transform 180ms ease,
     border-color 180ms ease,
     box-shadow 180ms ease,
     background 180ms ease;
@@ -713,7 +949,6 @@ button {
 
 .finding-card:hover,
 .finding-card.active {
-  transform: translateY(-1px);
   border-color: rgba(111, 192, 255, 0.32);
   box-shadow: 0 18px 36px rgba(0, 0, 0, 0.24);
 }
@@ -730,6 +965,15 @@ button {
 .finding-card p {
   margin: 0;
   line-height: 1.55;
+}
+
+.finding-card-summary {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+  word-break: break-word;
 }
 
 .finding-meta {

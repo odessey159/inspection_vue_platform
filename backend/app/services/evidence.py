@@ -1,42 +1,86 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from ..models import Finding, Project
-from ..settings import FFMPEG_BIN
+from ..settings import CLIP_COMPRESS_TIMEOUT_SECONDS, FFMPEG_BIN
 from .storage import read_json, remove_paths
 
+logger = logging.getLogger(__name__)
+_EVIDENCE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="evidence")
 
-def cache_evidence_frames(project: Project, findings: list[Finding]) -> dict[str, object]:
+
+def cache_evidence_frames(
+    project: Project,
+    findings: list[Finding],
+    *,
+    replace_all: bool = True,
+) -> dict[str, object]:
+    """Extract evidence frames from the project inspection video.
+
+    When ``replace_all`` is False (monitor path), existing frames are kept and
+    only missing timestamps are extracted.
+    """
     if not project.inspection_video_path:
         raise FileNotFoundError("Project video is missing")
 
     evidence_dir = _evidence_dir(project)
     evidence_dir.mkdir(parents=True, exist_ok=True)
-    removed_bytes = remove_paths(list(evidence_dir.glob("frame_*.jpg")))
+    removed_bytes = 0
+    if replace_all:
+        removed_bytes = remove_paths(list(evidence_dir.glob("frame_*.jpg")))
 
-    timestamps = sorted(
-        {
-            timestamp
-            for finding in findings
-            for timestamp in [finding.time_start_ms, *json.loads(finding.evidence_frame_ts_json), finding.time_end_ms]
-        }
-    )
+    timestamps = _finding_timestamps(findings)
     if not timestamps:
         return {"frame_count": 0, "removed_bytes": removed_bytes}
 
     video_start_ts = _video_start_ts(project)
-    for timestamp_ms in timestamps:
-        output_path = evidence_dir / f"frame_{timestamp_ms}.jpg"
-        _extract_frame(
-            video_path=Path(project.inspection_video_path),
-            timestamp_ms=timestamp_ms,
-            video_start_ts=video_start_ts,
-            output_path=output_path,
-        )
-    return {"frame_count": len(timestamps), "removed_bytes": removed_bytes}
+    video_path = Path(project.inspection_video_path)
+
+    if replace_all:
+        pending = timestamps
+    else:
+        pending = [ts for ts in timestamps if not (evidence_dir / f"frame_{ts}.jpg").exists()]
+
+    written = _extract_frames_parallel(
+        video_path=video_path,
+        timestamps=pending,
+        video_start_ts=video_start_ts,
+        evidence_dir=evidence_dir,
+    )
+    return {"frame_count": written, "removed_bytes": removed_bytes}
+
+
+def append_evidence_frames_from_clip(
+    project: Project,
+    findings: list[Finding],
+    *,
+    clip_path: Path,
+    clip_start_ts_ms: int,
+) -> dict[str, object]:
+    """Append evidence frames extracted from a short segment clip (no wipe)."""
+    if not clip_path.exists():
+        raise FileNotFoundError(f"Evidence clip not found: {clip_path}")
+
+    evidence_dir = _evidence_dir(project)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamps = _finding_timestamps(findings)
+    missing = [ts for ts in timestamps if not (evidence_dir / f"frame_{ts}.jpg").exists()]
+    if not missing:
+        return {"frame_count": 0, "removed_bytes": 0}
+
+    written = _extract_frames_parallel(
+        video_path=clip_path,
+        timestamps=missing,
+        video_start_ts=clip_start_ts_ms,
+        evidence_dir=evidence_dir,
+    )
+    return {"frame_count": written, "removed_bytes": 0}
 
 
 def cached_frame_path(project: Project, timestamp_ms: int) -> Path | None:
@@ -44,6 +88,16 @@ def cached_frame_path(project: Project, timestamp_ms: int) -> Path | None:
     if path.exists():
         return path
     return None
+
+
+def _finding_timestamps(findings: list[Finding]) -> list[int]:
+    return sorted(
+        {
+            timestamp
+            for finding in findings
+            for timestamp in [finding.time_start_ms, *json.loads(finding.evidence_frame_ts_json), finding.time_end_ms]
+        }
+    )
 
 
 def _evidence_dir(project: Project) -> Path:
@@ -61,7 +115,55 @@ def _video_start_ts(project: Project) -> int:
     return int(value)
 
 
-def _extract_frame(*, video_path: Path, timestamp_ms: int, video_start_ts: int, output_path: Path) -> None:
+def _extract_frames_parallel(
+    *,
+    video_path: Path,
+    timestamps: list[int],
+    video_start_ts: int,
+    evidence_dir: Path,
+) -> int:
+    """Extract frames in parallel with per-timestamp ffmpeg invocations.
+
+    Each timestamp gets a dedicated ffmpeg call with exact seek (preserving the
+    original correctness guarantees).  A bounded thread pool ensures we never
+    start more than 4 concurrent ffmpeg processes.
+    """
+    if not timestamps:
+        return 0
+
+    futures = {}
+    for timestamp_ms in timestamps:
+        output_path = evidence_dir / f"frame_{timestamp_ms}.jpg"
+        futures[
+            _EVIDENCE_EXECUTOR.submit(
+                _extract_one_frame,
+                video_path=video_path,
+                timestamp_ms=timestamp_ms,
+                video_start_ts=video_start_ts,
+                output_path=output_path,
+            )
+        ] = output_path
+
+    written = 0
+    for future in as_completed(futures):
+        success = future.result()
+        if success:
+            written += 1
+        else:
+            output_path = futures[future]
+            output_path.unlink(missing_ok=True)
+
+    return written
+
+
+def _extract_one_frame(
+    *,
+    video_path: Path,
+    timestamp_ms: int,
+    video_start_ts: int,
+    output_path: Path,
+) -> bool:
+    """Run ffmpeg to extract one frame at the given timestamp.  Returns True on success."""
     relative_seconds = max(0.0, (timestamp_ms - video_start_ts) / 1000.0)
     command = [
         FFMPEG_BIN,
@@ -76,6 +178,12 @@ def _extract_frame(*, video_path: Path, timestamp_ms: int, video_start_ts: int, 
         "3",
         str(output_path),
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=CLIP_COMPRESS_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        logger.warning("Evidence frame extraction timed out at %sms", timestamp_ms)
+        return False
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "ffmpeg evidence extraction failed")
+        logger.warning("Evidence frame extraction failed at %sms: %s", timestamp_ms, result.stderr.strip() or "unknown")
+        return False
+    return True

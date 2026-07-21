@@ -2,44 +2,210 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
+import shutil
 
 from sqlmodel import Session, select
 
 from ..models import Project
-from ..settings import DEFAULT_STANDARDS_DIR, DISCOVERY_ROOTS, SECURITY_CHECK_CALIBRATION_PATH, SUPPORTED_VISION_MODELS, VISION_MODEL
+from ..settings import DEFAULT_STANDARDS_DIR, DISCOVERY_ROOTS, PROJECTS_DIR, SECURITY_CHECK_CALIBRATION_PATH, SUPPORTED_VISION_MODELS, VISION_MODEL
 from .dataset import build_dataset_summary, parse_pairs_csv, parse_pose_csv
 from .extractors import export_camera_lidar_pairs, export_pose_calibration
 from .provider import provider_available
+from .provider_YOLO import provider_yolo_available, yolo_available
 from .rosbag import is_rosbag_dir, parse_rosbag_summary
+from .rtsp_recorder import DEFAULT_RTSP_RECORD_SECONDS, DEFAULT_RTSP_URL
+from .rtsp_vehicles import is_point_cloud_enabled, point_cloud_settings_payload, rtsp_vehicle_payloads
+from .rtsp_auto_analysis import rtsp_auto_analysis_settings_payload
+from .rtsp_watchdog import rtsp_watch_settings_payload
 from .runtime import compact_project_runtime
-from .rules import export_rules_payload, parse_rules
+from .rules import export_rules_payload, parse_rules, sync_rules_to_db
 from .scene import build_scene
-from .storage import ensure_project_dirs, write_json
+from .storage import ensure_project_dirs, read_json, write_json
 from .video import build_video
+
+SAMPLE_SCENE_PATH = Path(__file__).resolve().parents[2] / "tests" / "pcd" / "scene.json"
 
 
 def bootstrap_paths() -> dict[str, object]:
     bag_dirs = _discover_bag_dirs()
     standards_dirs = _discover_standards_dirs()
     preferred_standards = _preferred_standards_dir(standards_dirs)
+    rtsp_watch_settings = rtsp_watch_settings_payload()
+    rtsp_auto_analysis = rtsp_auto_analysis_settings_payload()
+    point_cloud = point_cloud_settings_payload()
+    sample_scene = str(SAMPLE_SCENE_PATH.resolve()) if SAMPLE_SCENE_PATH.is_file() else None
     return {
         "sample_bag_dir": bag_dirs[0] if bag_dirs else None,
+        "sample_scene_path": sample_scene,
+        "sample_pcd_path": sample_scene,
         "sample_standards_dir": preferred_standards,
+        "default_rtsp_url": DEFAULT_RTSP_URL,
+        "default_rtsp_record_seconds": DEFAULT_RTSP_RECORD_SECONDS,
+        "rtsp_vehicles": rtsp_vehicle_payloads(),
         "detected_bag_dirs": bag_dirs,
         "detected_standards_dirs": standards_dirs,
         "provider_available": provider_available(),
+        "yolo_available": yolo_available(),
+        "provider_yolo_available": provider_yolo_available(),
         "default_analysis_model": VISION_MODEL,
         "supported_analysis_models": SUPPORTED_VISION_MODELS,
+        "rtsp_watch_test_mode": rtsp_watch_settings["test_mode"],
+        "rtsp_watch_test_max_seconds": rtsp_watch_settings["test_max_seconds"],
+        "rtsp_auto_analysis_enabled": rtsp_auto_analysis["enabled"],
+        "rtsp_auto_analysis_mode": rtsp_auto_analysis["mode"],
+        "point_cloud_enabled": point_cloud["point_cloud_enabled"],
     }
+
+
+def resolve_scene_path(path: Path) -> Path:
+    path = path.resolve()
+    if path.is_file() and path.name.lower() == "scene.json":
+        return path
+    if path.is_file() and path.suffix.lower() == ".json" and "scene" in path.stem.lower():
+        return path
+    if path.is_dir():
+        candidate = path / "scene.json"
+        if candidate.is_file():
+            return candidate
+        matches = sorted(path.glob("*scene*.json"))
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise ValueError(f"Multiple scene JSON files found in {path}; pass a specific scene.json path")
+    raise FileNotFoundError(f"Not a scene.json file or directory containing one: {path}")
+
+
+def is_static_scene_import_source(path: Path) -> bool:
+    try:
+        resolve_scene_path(path)
+        return True
+    except (FileNotFoundError, ValueError, OSError):
+        return False
+
+
+# Backward-compatible aliases used by older tests/call sites.
+def resolve_pcd_path(path: Path) -> Path:
+    return resolve_scene_path(path)
+
+
+def is_pcd_import_source(path: Path) -> bool:
+    return is_static_scene_import_source(path)
 
 
 def list_projects(session: Session) -> list[Project]:
     return list(session.exec(select(Project).order_by(Project.created_at.desc())))
 
 
+def import_static_scene_project(session: Session, name: str, scene_source: Path, standards_dir: Path) -> Project:
+    source_scene_path = resolve_scene_path(scene_source)
+    standards_dir = standards_dir.resolve() if str(standards_dir).strip() else Path(".")
+    standards_available = standards_dir.exists() and standards_dir.is_dir() and _is_standards_dir(standards_dir)
+
+    project = Project(
+        name=name,
+        status="indexing",
+        bag_dir=str(source_scene_path),
+        standards_dir=str(standards_dir) if standards_available else "",
+        artifacts_dir="",
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    session.add(project)
+    session.commit()
+    session.refresh(project)
+    if project.id is None:
+        raise RuntimeError("Project creation failed")
+
+    project_dirs = ensure_project_dirs(project.id)
+    project.artifacts_dir = str(project_dirs["root"])
+
+    try:
+        rules = parse_rules(standards_dir, project.id) if standards_available else []
+        rules_path = project_dirs["summaries"] / "rules.json"
+        scene_path = project_dirs["scenes"] / "scene.json"
+        dataset_summary_path = project_dirs["summaries"] / "dataset_summary.json"
+
+        shutil.copy2(source_scene_path, scene_path)
+        scene_payload = read_json(scene_path)
+        if not isinstance(scene_payload, dict) or not scene_payload.get("points"):
+            raise ValueError(f"Invalid scene.json payload: {source_scene_path}")
+
+        if not standards_available:
+            notes = list(scene_payload.get("notes", []))
+            notes.append("Standards directory was not provided; scene-only import with empty rules.")
+            scene_payload["notes"] = notes
+            write_json(scene_path, scene_payload)
+
+        write_json(
+            dataset_summary_path,
+            {
+                "source_type": "static_scene_json",
+                "scene_path": str(source_scene_path),
+                "raw_point_count": int(
+                    scene_payload.get("raw_point_count")
+                    or scene_payload.get("scene_quality", {}).get("input_point_count", 0)
+                    or len(scene_payload.get("points", []))
+                ),
+                "video_start_ts": 0,
+                "video_end_ts": 0,
+                "point_start_ts": 0,
+                "point_end_ts": 0,
+                "median_video_gap_ms": 0,
+                "median_point_gap_ms": 0,
+                "inferred_fps": 0.0,
+                "time_offset_ms": 0,
+            },
+        )
+        write_json(rules_path, export_rules_payload(rules))
+        sync_rules_to_db(rules)
+        for rule in rules:
+            session.add(rule)
+
+        project.status = "indexed"
+        project.video_topic = None
+        project.point_topic = str(source_scene_path)
+        project.pose_topic = "static_scene"
+        project.bag_start_ts = 0
+        project.bag_end_ts = 0
+        project.bag_duration_ms = 0
+        project.message_count = int(
+            scene_payload.get("raw_point_count")
+            or scene_payload.get("scene_quality", {}).get("input_point_count", 0)
+            or len(scene_payload.get("points", []))
+        )
+        project.rules_count = len(rules)
+        project.findings_count = 0
+        project.calibration_required = False
+        project.time_offset_ms = 0
+        project.rules_path = str(rules_path)
+        project.scene_path = str(scene_path)
+        project.inspection_video_path = None
+        project.updated_at = datetime.now(timezone.utc)
+
+        session.add(project)
+        session.commit()
+        compact_project_runtime(project_dirs["root"])
+        session.refresh(project)
+        return project
+    except Exception:
+        project.status = "failed"
+        project.updated_at = datetime.now(timezone.utc)
+        session.add(project)
+        session.commit()
+        raise
+
+
+def import_pcd_project(session: Session, name: str, pcd_path: Path, standards_dir: Path) -> Project:
+    """Backward-compatible alias: static map import now reads scene.json."""
+    return import_static_scene_project(session, name, pcd_path, standards_dir)
+
+
 def import_project(session: Session, name: str, bag_dir: Path, standards_dir: Path) -> Project:
     bag_dir = bag_dir.resolve()
     standards_dir = standards_dir.resolve()
+
+    if is_static_scene_import_source(bag_dir):
+        return import_static_scene_project(session, name, bag_dir, standards_dir)
 
     if not is_rosbag_dir(bag_dir):
         raise FileNotFoundError(f"Not a valid rosbag directory: {bag_dir}")
@@ -118,6 +284,7 @@ def import_project(session: Session, name: str, bag_dir: Path, standards_dir: Pa
         write_json(rosbag_summary_path, summary)
         write_json(dataset_summary_path, dataset_summary)
         write_json(rules_path, export_rules_payload(rules))
+        sync_rules_to_db(rules)
 
         for rule in rules:
             session.add(rule)
@@ -163,6 +330,19 @@ def project_runtime_paths(project: Project) -> dict[str, Path]:
         "video_manifest": root / "manifests" / "video_manifest.json",
         "evidence_frames": root / "evidence_frames",
     }
+
+
+def resolve_inspection_video_url(project: Project) -> str | None:
+    if project.id is None:
+        return None
+    canonical = PROJECTS_DIR / str(project.id) / "artifacts" / "inspection.mp4"
+    if canonical.is_file() and canonical.stat().st_size > 0:
+        return f"/artifacts/{project.id}/artifacts/inspection.mp4"
+    if project.inspection_video_path:
+        legacy = Path(project.inspection_video_path)
+        if legacy.is_file() and legacy.stat().st_size > 0:
+            return f"/artifacts/{project.id}/artifacts/inspection.mp4"
+    return None
 
 
 def _resolve_pose_path(pose_dir: Path) -> tuple[Path, str]:

@@ -1,0 +1,84 @@
+配电箱:
+  - 配电箱
+  - 配电柜
+  - 电气柜
+  - 开关柜
+  - distribution_box
+  - electrical_box
+  - electric_cabinet
+  - cabinet
+  - powerbox
+
+灭火器:
+  - 灭火器
+  - fire_extinguisher
+  - extinguisher
+
+柜门:
+  - 柜门
+  - cabinet_door
+  - door
+
+消防通道:
+  - 消防通道
+  - fire_escape
+  - emergency_exit
+  - passage
+  - exit
+
+人员:
+  - 人
+  - 人员
+  - person
+  - worker
+  - human
+
+消火栓:
+  - 消火栓
+  - 消防栓
+  - firecock
+
+警示标志:
+  - 警示标志
+  - warning
+
+火灾探测器:
+  - 火灾探测器
+  - 感烟感温探测器
+  - firedetect
+
+火灾报警器:
+  - 火灾报警器
+  - 报警按钮
+  - 报警装置
+  - firealarm
+
+粉尘:
+  - 粉尘
+  - 积尘
+  - dust
+  - dustcover
+  - dustduct
+  - dustremover
+  - 作业现场地面
+  - 设备表面
+
+机械设备:
+  - 机械设备
+  - 车床
+  - 切割机
+  - 传送带
+  - 旋转部件
+  - 防护罩
+  - sander
+  - woodmachine
+  - planer
+  - forklift
+  - hook
+  - hookpulley
+
+禁烟标志:
+  - 禁烟标志
+  - 烟头
+  - 打火机
+  - 可燃物料堆垛

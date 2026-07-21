@@ -9,12 +9,16 @@ const props = defineProps<{
   currentProject: ProjectSummary | null;
   statusLabel: string;
   loading: boolean;
+  rtspWatchTestMode: boolean;
+  rtspWatchTestMaxSeconds: number;
 }>();
 
 const emit = defineEmits<{
   refresh: [];
   selectProject: [projectId: number | null];
+  clearRtspRecordings: [];
   resetRuntime: [];
+  updateRtspWatchTestMode: [enabled: boolean];
 }>();
 
 const projectSummary = computed(() => {
@@ -35,6 +39,11 @@ function onProjectChange(event: Event) {
     return;
   }
   emit("selectProject", Number(target.value));
+}
+
+function onRtspWatchTestModeChange(event: Event) {
+  const target = event.target as HTMLInputElement | null;
+  emit("updateRtspWatchTestMode", Boolean(target?.checked));
 }
 </script>
 
@@ -63,6 +72,21 @@ function onProjectChange(event: Event) {
       </div>
 
       <button class="ghost-button" @click="$emit('refresh')">刷新索引</button>
+      <label
+        class="field compact-field rtsp-test-toggle"
+        :title="`测试模式下单次录制上限 ${Math.round(rtspWatchTestMaxSeconds / 60)} 分钟，超过 5 条录制时会删除最早的一条后再录`"
+      >
+        <span>RTSP 测试模式</span>
+        <input
+          type="checkbox"
+          :checked="rtspWatchTestMode"
+          :disabled="loading"
+          @change="onRtspWatchTestModeChange"
+        />
+      </label>
+      <button class="ghost-button danger-button" :disabled="loading" @click="$emit('clearRtspRecordings')">
+        清空 RTSP 录制
+      </button>
       <button class="ghost-button danger-button" :disabled="loading" @click="$emit('resetRuntime')">清空 .runtime</button>
     </div>
   </header>

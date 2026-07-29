@@ -8,6 +8,9 @@ Publishes two synchronized paths from one FFmpeg process:
   - video: rtsp://127.0.0.1:18554/live
   - time:  rtsp://127.0.0.1:18554/time  (mapped scene timeline, loops with video)
 
+Both streams burn a machine-readable binary timestamp barcode (top-left) so
+recorders can sample the RTSP timeline instead of wall-clock recording time.
+
 Default mapped timeline (UTC, matches rosbag scene.json first pose):
   first frame -> 2026-03-24 05:05:48.518
   later frames advance 1:1 with video PTS (no end clamp)
@@ -56,6 +59,11 @@ DEFAULT_FONT_CANDIDATES = (
 
 # Align with rosbag-derived scene.json first trajectory timestamp.
 DEFAULT_TIME_START = "2026-03-24 05:05:48.518"
+
+# Machine-readable timestamp barcode (must match app.services.rtsp_timeline).
+TIMESTAMP_BARCODE_BITS = 48
+TIMESTAMP_BARCODE_BIT_WIDTH = 8
+TIMESTAMP_BARCODE_HEIGHT = 16
 
 
 def resolve_ffmpeg_bin() -> str:
@@ -218,6 +226,29 @@ def _encode_timeline_setpts(*, fps: int) -> str:
     return f"setpts=N/{rate}/TB"
 
 
+def _timestamp_barcode_filter() -> str:
+    """Paint floor(T*1000) as a binary barcode while T is still the mapped unix seconds.
+
+    Recorders decode this after grabbing one frame from ``/time`` (or ``/live``).
+    Large black/white blocks survive H.264 ultrafast better than exact RGB bytes.
+    """
+    bits = TIMESTAMP_BARCODE_BITS
+    bit_w = TIMESTAMP_BARCODE_BIT_WIDTH
+    bit_h = TIMESTAMP_BARCODE_HEIGHT
+    width = bits * bit_w
+    # LSB at left. T is seconds after mapped setpts.
+    paint = (
+        f"255*mod(floor(T*1000/pow(2\\,floor(X/{bit_w})))\\,2)"
+    )
+    return (
+        "format=rgb24,"
+        "geq="
+        f"r='if(between(X\\,0\\,{width - 1})*between(Y\\,0\\,{bit_h - 1})\\,{paint}\\,r(X\\,Y))':"
+        f"g='if(between(X\\,0\\,{width - 1})*between(Y\\,0\\,{bit_h - 1})\\,{paint}\\,g(X\\,Y))':"
+        f"b='if(between(X\\,0\\,{width - 1})*between(Y\\,0\\,{bit_h - 1})\\,{paint}\\,b(X\\,Y))'"
+    )
+
+
 def _labeled_testsrc(label: str, *, width: int, height: int, fps: int) -> str:
     """Test pattern with a static label only (timeline clock is applied later)."""
     safe_label = label.replace(":", r"\:").replace("'", r"\'")
@@ -267,6 +298,7 @@ def _time_channel_filter(
     """Build a filter that turns a video pad into a looping mapped-timeline time channel."""
     display_pts = _mapped_timeline_setpts(start_s=start_s, duration_s=duration_s)
     encode_pts = _encode_timeline_setpts(fps=fps)
+    barcode = _timestamp_barcode_filter()
     clock = _drawtext_mapped_clock_expr()
     unix_s = _drawtext_unix_seconds_expr()
     return (
@@ -281,6 +313,7 @@ def _time_channel_filter(
         f"x=(w-text_w)/2:y=(h-text_h)/2-18:fontsize=40:fontcolor=yellow{fontfile},"
         f"drawtext=text='unix_s {unix_s}':"
         f"x=(w-text_w)/2:y=(h-text_h)/2+28:fontsize=30:fontcolor=cyan{fontfile},"
+        f"{barcode},"
         f"{encode_pts},"
         f"drawtext=text='enc PTS %{{pts\\:hms}}  n=%{{n}}':"
         f"x=24:y=h-36:fontsize=22:fontcolor=white{fontfile}[tout]"
@@ -298,6 +331,7 @@ def _video_overlay_chain(
 ) -> str:
     display_pts = _mapped_timeline_setpts(start_s=start_s, duration_s=duration_s)
     encode_pts = _encode_timeline_setpts(fps=fps)
+    barcode = _timestamp_barcode_filter()
     clock = _drawtext_mapped_clock_expr()
     return (
         f"{display_pts},"
@@ -305,6 +339,7 @@ def _video_overlay_chain(
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
         f"drawtext=text='{clock}':"
         f"x=24:y=h-48:fontsize=28:fontcolor=yellow{fontfile},"
+        f"{barcode},"
         f"{encode_pts}"
     )
 

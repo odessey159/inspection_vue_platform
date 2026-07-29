@@ -10,6 +10,7 @@ class ProjectImportRequest(BaseModel):
     name: str = Field(default="Inspection Workspace")
     bag_dir: str
     standards_dir: str
+    vehicle_id: Optional[str] = None
     rtsp_duration_sec: Optional[float] = Field(default=None, gt=0)
     rtsp_transport: Optional[Literal["tcp", "udp"]] = "tcp"
 

@@ -13,10 +13,10 @@
 1. 导入 ROS 2 rosbag 数据目录，或绑定巡检小车 RTSP 流
 2. 解析相机、激光雷达、位姿等主题数据（rosbag 路径）
 3. 解析行业标准文档并生成结构化隐患规则
-4. 生成巡检视频与三维场景
+4. 生成巡检视频与三维场景（含车端地图预览与传输压缩）
 5. 通过 Demo、Provider 或 YOLO + Provider 模式生成隐患识别结果
-6. 在视频、证据帧、规则详情和三维场景之间建立联动
-7. 对 RTSP 流进行自动录制、实时预览与可选的自动分析
+6. 在视频、证据帧、规则详情和三维场景之间建立时间轴联动
+7. 对 RTSP 流进行自动录制、实时预览、时间轴对齐与可选的自动分析
 
 ### 1.2 当前交付范围
 
@@ -27,6 +27,10 @@
 - **RTSP 看门狗**：后台轮询车辆流，流上线时自动录制；支持测试模式（时长/数量上限）
 - **RTSP 实时预览**：MJPEG 直播与项目级 RTSP 回放
 - **RTSP 自动分析**：流连接后可按配置自动触发 `provider_yolo` 分析
+- **RTSP 时间轴对齐**：录制时优先从流内时间戳条码 / `/time` 旁路采样 `video_start_ts`，并写入 `*.meta.json`，使视频时钟与车端地图轨迹共用同一原点
+- **车端地图预览**：按车辆加载 `.runtime/robots/<id>/maps/scene.json`，导入前即可在三维视口预览
+- **场景传输压缩**：API 下发时合并重复点云层，并缓存 `scene.web.json`，加快大地图加载
+- **地图–视频时间同步**：轨迹点击与视频播放按绝对时间戳联动；时钟不一致时线性重映射
 - rosbag 元数据识别和主题推断
 - 相机图像 / 点云 / 位姿提取
 - 巡检视频 `inspection.mp4` 生成
@@ -39,6 +43,7 @@
 - 三维场景重建与展示
 - 基于图像的 SFM 场景重建的初步实现
 - 证据帧缓存与 findings 复核
+- **跨平台路径解析**：项目产物路径以相对路径持久化，兼容 Windows 宿主机 ↔ Linux/Docker
 
 ### 1.3 交付包含内容
 
@@ -77,7 +82,8 @@ inspection_vue_platform/
 │  │  └─ services/              # 核心业务服务
 │  │     ├─ provider.py         # 大模型分析
 │  │     ├─ provider_YOLO.py    # YOLO + Provider 联合分析
-│  │     ├─ rtsp_*.py           # RTSP 录制、看门狗、直播、自动分析
+│  │     ├─ rtsp_*.py           # RTSP 录制、看门狗、直播、自动分析、时间轴
+│  │     ├─ scene_transport.py  # 大场景 JSON 压缩与 web 缓存
 │  │     ├─ rule_retriever.py   # Rule RAG 检索
 │  │     └─ ...
 │  ├─ yolo_service/             # 独立 YOLO 推理服务（默认端口 8001）
@@ -85,21 +91,27 @@ inspection_vue_platform/
 │  ├─ models/YOLO/              # YOLO 权重与类别说明
 │  ├─ scripts/run_yolo_service.ps1
 │  ├─ rosenv/                   # 内置 rosbag 提取脚本与消息定义
-│  ├─ tests/                    # 后端测试（含 RTSP / YOLO 用例）
+│  ├─ tests/                    # 后端测试（含 RTSP / YOLO / 时间轴用例）
 │  ├─ requirements.txt
 │  ├─ requirements-yolo.txt     # YOLO 服务额外依赖
 │  └─ Dockerfile
 ├─ web/                         # Vue 3 前端
 │  ├─ src/
-│  │  ├─ lib/analysisMode.ts    # 分析模式选择与文案
-│  │  └─ components/            # ImportPanel、AnalysisPanel 等
+│  │  ├─ lib/
+│  │  │  ├─ analysisMode.ts    # 分析模式选择与文案
+│  │  │  └─ sceneTime.ts       # 地图轨迹与视频时钟对齐
+│  │  └─ components/            # ImportPanel、SceneViewport、VideoEvidencePanel 等
 │  ├─ package.json
-│  ├─ nginx.conf
-│  └─ Dockerfile
+│  ├─ nginx.conf                # 生产静态部署
+│  ├─ Dockerfile                # 生产镜像
+│  ├─ Dockerfile.dev            # Compose 开发镜像（Vite HMR）
+│  └─ docker-entrypoint.dev.sh
 ├─ config/                      # 校准等静态配置
 ├─ inputs/                      # 推荐挂载的输入目录（rosbag / standards）
 ├─ .runtime/                    # 运行时数据库和项目产物
-│  └─ YOLO_log/                 # YOLO 检测日志
+│  ├─ YOLO_log/                 # YOLO 检测日志
+│  ├─ rtsp_recordings/          # RTSP 看门狗录制（含 *.meta.json）
+│  └─ robots/<vehicle_id>/      # 车端录制与 maps/scene.json
 ├─ docker-compose.yml
 ├─ docker-run.ps1
 ├─ docker-run.sh
@@ -166,7 +178,10 @@ cp .env.example .env
 - Web：`http://127.0.0.1:8700`
 - API：`http://127.0.0.1:8010`
 
-**注意：** Docker Compose 当前只包含 `backend` 与 `web` 容器。YOLO 服务默认在**宿主机**运行（端口 8001），后端通过 `YOLO_API_URL=http://host.docker.internal:8001` 访问。若需完整 `provider_yolo` 能力，请先在宿主机启动 YOLO 服务。
+**注意：**
+
+- Docker Compose 当前包含 `backend` 与 `web` 容器；`web` 默认使用 `Dockerfile.dev`（Vite 开发服 + HMR，宿主机 `8700` 映射容器 `5173`）。生产静态构建仍可用 `web/Dockerfile` + Nginx。
+- YOLO 服务默认在**宿主机**运行（端口 8001），后端通过 `YOLO_API_URL=http://host.docker.internal:8001` 访问。若需完整 `provider_yolo` 能力，请先在宿主机启动 YOLO 服务。
 
 ### 3.3 首次导入前准备
 
@@ -196,8 +211,9 @@ inputs/
 #### RTSP 导入
 
 1. 编辑 `backend/config/rtsp_vehicles.yaml`，配置巡检小车 ID、名称与 RTSP 地址。
-2. 确保 RTSP 流可访问（本地测试可用 `backend/tests/start_rtsp_server.ps1` 配合测试视频）。
-3. 在前端「选择巡检小车」步骤选取车辆，或手动填写 RTSP URL 导入项目。
+2. 确保 RTSP 流可访问（本地测试可用 `backend/tests/start_rtsp_server.ps1` 配合 `generate_rtsp_stream.py`；测试流会同时发布 `/live` 与带时间戳条码的 `/time`）。
+3. （可选）将车端点云地图放到 `.runtime/robots/<vehicle_id>/maps/scene.json`，前端选车后可立即预览。
+4. 在前端「选择巡检小车」步骤选取车辆，或手动填写 RTSP URL 导入项目。
 
 ## 4. 核心能力说明
 
@@ -275,7 +291,8 @@ Set-Location backend
 
 后端启动时会自动拉起 RTSP 看门狗（`rtsp_watchdog`），轮询 `rtsp_vehicles.yaml` 中的流地址：
 
-- 流上线 → 自动开始录制到 `.runtime/rtsp_recordings/`
+- 流上线 → 自动开始录制到 `.runtime/rtsp_recordings/`（或车辆目录下的 recordings）
+- 录制开始前通过 `rtsp_timeline` 解析视频时钟原点（优先流内时间戳条码 / `/time`，其次车端地图轨迹原点，最后回退墙钟），并写入同名 `*.meta.json`
 - 流断开 → 停止录制，可选触发自动分析（`RTSP_WATCH_AUTO_ANALYSIS_MODE`）
 - 测试模式（`RTSP_WATCH_TEST_MODE=true`）：单次录制最长 10 分钟，每车最多保留 5 段，超出时删除最旧录制
 
@@ -285,10 +302,11 @@ Set-Location backend
 |------|------|
 | `GET /api/rtsp-live` | MJPEG 实时预览 |
 | `GET /api/projects/{id}/rtsp-live` | 项目级 RTSP 直播 |
-| `GET /api/rtsp-playback-state` | 查询录制/播放状态 |
+| `GET /api/rtsp-playback-state` | 查询录制/播放状态（含 live/recorded `video_start_ts`） |
 | `GET /api/rtsp-recordings/{key}/latest` | 获取最新录制文件 |
 | `DELETE /api/rtsp-recordings` | 清空所有 RTSP 录制 |
 | `GET/PATCH /api/rtsp-watch-settings` | 看门狗测试模式开关 |
+| `GET /api/rtsp-vehicles/{vehicle_id}/scene` | 加载车端 `maps/scene.json`（经传输压缩）预览 |
 
 ### 4.5 Rule RAG（可选）
 
@@ -300,15 +318,25 @@ Set-Location backend
 
 适用于规则库较大、希望减少 token 消耗的场景。关闭时仍使用完整规则 prompt（与早期行为一致）。
 
-### 4.6 三维场景
+### 4.6 三维场景与时间同步
 
 系统支持两种场景来源：
 
 - `lidar`
-  - 基于点云和位姿生成主场景
+  - 基于点云和位姿生成主场景；RTSP 项目也可关联车端 onboard 地图
 - `sfm`
   - 基于图像和 COLMAP 重建场景，该功能处于初步开发阶段
 
+为加快前端加载，`GET /api/projects/{id}/scene` 与车端地图接口会对大体积 `scene.json` 做传输压缩（`scene_transport`）：合并重复点云层，优先保留 `render_points`，并在地图旁缓存 `scene.web.json`。
+
+地图与视频联动：
+
+1. 录制 / 导入时写入 `video_start_ts` / `video_end_ts`
+2. 若轨迹时间戳与视频时钟已同原点（RTSP timeline 共享），直接绝对时间同步
+3. 否则线性重映射轨迹到视频时钟（后端 `align_scene_timestamps_to_video`，前端 `sceneTime.ts`）
+4. 视口点击轨迹点 → 视频按 `(ts - video_start_ts) / 1000` 跳转；视频播放 → 高亮对应位姿
+
+项目路径（`scene_path`、视频路径等）写入数据库时使用相对路径，避免 Windows 绝对路径在 Docker/Linux 下失效。
 ## 5. 文档索引
 
 - 架构说明：`ARCHITECTURE.md`
@@ -320,8 +348,9 @@ Set-Location backend
 - YOLO 服务需单独启动，且权重文件 `security_check_540.pt` 需自行放置到 `backend/models/YOLO/`
 - `provider` / `provider_yolo` 主链路当前按 DashScope 兼容接口设计
 - Docker 部署时，后端通过 `host.docker.internal:8001` 访问宿主机 YOLO 服务
+- Compose 开发模式下前端为 Vite HMR；若需要 Nginx 生产静态资源，请改用 `web/Dockerfile`
 - 导入的 rosbag 数据需符合当前自定义消息结构
-
+- 车端地图需自行放到 `.runtime/robots/<vehicle_id>/maps/scene.json`；缺失时三维预览不可用，但不影响录制与分析
 ## 7. 配置说明
 
 推荐在项目根目录创建 `.env` 作为主配置文件：
@@ -387,10 +416,9 @@ RTSP_WATCH_TEST_MODE=true
 
 - **Docker 模式**
   - `backend` 容器（8010）
-  - `web` 容器（8700）
+  - `web` 容器（8700，默认 Vite 开发服；生产可换 Nginx 镜像）
   - 宿主机 YOLO 服务（8001）
   - 宿主机挂载：`.runtime/`、`inputs/`
-
 - **交付模式**
   - 同上 Docker 模式，配合预置 `inputs/` 与配置文件
 
@@ -509,9 +537,11 @@ SQLite 数据库位于：
 
 其他运行时目录：
 
-- `.runtime/rtsp_recordings/` — RTSP 看门狗录制文件
+- `.runtime/rtsp_recordings/` — RTSP 看门狗录制文件（同名 `*.meta.json` 记录 `video_start_ts` 来源）
+- `.runtime/robots/<vehicle_id>/`
+  - `recordings/` — 按车归档的录制
+  - `maps/scene.json` — 车端点云地图（可选旁路缓存 `scene.web.json`）
 - `.runtime/YOLO_log/` — YOLO 检测日志
-
 ### 8.6 常见问题
 
 Docker 启动成功但导入失败时，优先检查：
@@ -541,7 +571,14 @@ RTSP 相关问题时，优先检查：
 - `ffmpeg` 是否可用（录制依赖）
 - 看门狗是否开启（`RTSP_WATCH_ENABLED`）
 - 测试模式下录制时长/数量是否触达上限
+- 时间轴不同步时：测试流是否发布了 `/time` 条码，或录制旁是否存在 `*.meta.json`
+- 车端地图 404：`.runtime/robots/<id>/maps/scene.json` 是否存在，以及点云开关是否开启
 
+三维场景加载缓慢或点云为空时，优先检查：
+
+- 原始 `scene.json` 是否含多份重复点云层（传输压缩会合并为 `render_points`）
+- `scene.web.json` 缓存是否过期（修改源地图后应自动按 mtime 失效）
+- 数据库中 `scene_path` 是否仍为另一 OS 的绝对路径（当前会写回相对路径）
 SFM 重建失败时，常见原因：
 
 - `COLMAP_BIN` 未配置
@@ -586,5 +623,6 @@ SFM 重建失败时，常见原因：
 6. `demo` 分析可跑通
 7. 若配置 provider，真实分析可跑通
 8. 若配置 provider_yolo，YOLO + 大模型联合分析可跑通
-9. 若启用 RTSP 看门狗，流上线后能自动录制
-10. 若启用 SFM，COLMAP 可用
+9. 若启用 RTSP 看门狗，流上线后能自动录制，且 `*.meta.json` 中有合理的 `video_start_ts`
+10. 选中配置了 `maps/scene.json` 的车辆后，三维视口能预览车端地图，并与视频时间联动
+11. 若启用 SFM，COLMAP 可用

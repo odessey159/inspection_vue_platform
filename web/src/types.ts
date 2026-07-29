@@ -239,6 +239,7 @@ export interface ProjectImportPayload {
   name: string;
   bag_dir: string;
   standards_dir: string;
+  vehicle_id?: string | null;
   rtsp_duration_sec?: number | null;
   rtsp_transport?: "tcp" | "udp" | null;
 }

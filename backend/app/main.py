@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .db import create_db_and_tables
@@ -17,6 +18,7 @@ from .settings import CORS_ORIGINS, PROJECTS_DIR
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    """Boot DB + robot dirs, then run RTSP cleanup/watchdog for the process lifetime."""
     create_db_and_tables()
     ensure_robot_runtime_dirs()
     start_rtsp_recording_cleanup_worker()
@@ -41,6 +43,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Shrink large scene JSON responses (point clouds) over the wire.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.include_router(projects_router)
 app.include_router(findings_router)

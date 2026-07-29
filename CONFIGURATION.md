@@ -205,9 +205,11 @@ docker compose up --build -d
 如果使用：
 
 - `provider` 模式
+- `provider_yolo` 模式
 
 但没有配置 `VISION_API_KEY`，分析会失败。
 
+`provider_yolo` 还额外需要可达的 YOLO 服务（`YOLO_API_URL`）。
 ## 6. `.env.example` 的作用
 
 `.env.example` 是模板文件，不应该放真实密钥。
@@ -269,12 +271,51 @@ Copy-Item .env.example .env
 - `VISION_MAX_CLIP_BYTES`
 - `VISION_REQUEST_TIMEOUT_SECONDS`
 
-### 7.3 场景相关
+### 7.3 YOLO 相关
+
+- `YOLO_API_URL`
+  - 主后端访问 YOLO 服务的地址；本地默认 `http://127.0.0.1:8001`，Docker 后端常用 `http://host.docker.internal:8001`
+- `YOLO_DETECT_PATH` / `YOLO_RTSP_DETECT_PATH`
+  - 视频与 RTSP 检测端点路径
+- `YOLO_RTSP_SEGMENT_SECONDS` / `YOLO_RTSP_TRANSPORT`
+  - 直播分段时长与传输协议
+- `YOLO_CONFIDENCE_THRESHOLD` / `YOLO_FAIL_OPEN`
+  - 置信度阈值；失败时是否放行继续分析
+- `YOLO_WEIGHTS_PATH` / `YOLO_SERVICE_PORT` / `YOLO_LOG_DIR`
+  - 仅 YOLO 服务进程使用
+
+### 7.4 RTSP 相关
+
+- `RTSP_VEHICLES_PATH`
+  - 巡检小车列表 YAML
+- `RTSP_WATCH_ENABLED` / `RTSP_WATCH_POLL_INTERVAL_SECONDS`
+  - 看门狗开关与轮询间隔
+- `RTSP_WATCH_TEST_MODE` / `RTSP_WATCH_TEST_MAX_SECONDS` / `RTSP_WATCH_TEST_MAX_RECORDINGS`
+  - 测试模式录制上限
+- `RTSP_WATCH_AUTO_ANALYSIS_MODE`
+  - 流断开或稳定后自动分析模式（如 `provider_yolo`）；空字符串表示关闭
+- `RTSP_YOLO_MONITOR_LLM_ENABLED` / `RTSP_YOLO_MONITOR_LLM_ON_EMPTY` / `RTSP_YOLO_MONITOR_CAPTURE_CLIP`
+  - 直播 YOLO 监控是否联动大模型复核、空检测是否仍送审、是否截取 clip
+- `RTSP_RECORD_VIDEO_CODEC` / `RTSP_FFMPEG_RW_TIMEOUT_US` / `RTSP_PUBLISH_PROBE_TIMEOUT_SECONDS`
+  - 录制编码与超时
+- `RTSP_TRANSPORT` / `RTSP_TIMELINE_PROBE_TIMEOUT_SEC`
+  - 时间轴采样时的传输协议与探测超时（`rtsp_timeline`）
+
+### 7.5 Rule RAG 相关
+
+- `RULE_RAG_ENABLED`
+  - 默认关闭；开启后按 YOLO 类别检索规则片段
+- `RULE_RAG_FALLBACK_TOP_K`
+  - 检索失败时的兜底条数
+
+### 7.6 场景相关
 
 - `SCENE_VOXEL_SIZE`
 - `SCENE_MAX_POINTS`
 - `SCENE_RENDER_MAX_POINTS`
 - `SCENE_EGO_FILTER_ENABLED`
+- `POINT_CLOUD_ENABLED`
+  - 是否允许加载 / 展示车端点云地图
 
 这些参数主要影响：
 
@@ -283,7 +324,9 @@ Copy-Item .env.example .env
 - 地面裁剪
 - 自车过滤
 - 三维渲染点数
+- 车端地图预览开关
 
+传输层压缩（`scene_transport`）不依赖额外环境变量：API 返回时自动合并重复点云层，并在地图旁缓存 `scene.web.json`。
 ## 8. 最小可用示例
 
 ### 8.1 仅运行 demo 模式
@@ -322,4 +365,22 @@ VISION_MODEL=qwen3.5-plus
 
 ```env
 VISION_API_KEY=你的真实APIKey
+```
+
+### 8.3 运行 provider_yolo / RTSP 巡检
+
+在 8.2 基础上补充：
+
+```env
+YOLO_API_URL=http://127.0.0.1:8001
+RTSP_WATCH_ENABLED=true
+RTSP_WATCH_AUTO_ANALYSIS_MODE=provider_yolo
+# 可选：开启 Rule RAG
+RULE_RAG_ENABLED=false
+```
+
+并将车端地图（如有）放到：
+
+```text
+.runtime/robots/<vehicle_id>/maps/scene.json
 ```

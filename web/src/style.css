@@ -468,6 +468,30 @@ button {
   word-break: break-all;
 }
 
+.selected-vehicle-banner em {
+  justify-self: start;
+  margin-top: 2px;
+  color: var(--accent);
+  font-style: normal;
+  font-size: 12px;
+}
+
+.selected-vehicle-banner em[data-status="missing"],
+.selected-vehicle-banner em[data-status="error"] {
+  color: #ff8f7a;
+}
+
+.selected-vehicle-banner em[data-status="loading"] {
+  color: var(--muted);
+}
+
+.vehicle-map-hint {
+  margin: 2px 0 0;
+  color: var(--text-soft);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .selected-vehicle-banner.rosbag-mode {
   border-color: rgba(255, 181, 109, 0.18);
   background: rgba(255, 181, 109, 0.08);

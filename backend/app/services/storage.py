@@ -1,3 +1,5 @@
+"""Project runtime paths, JSON helpers, and cross-platform path resolution."""
+
 from __future__ import annotations
 
 import json
@@ -37,14 +39,98 @@ def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def resolve_project_path(artifacts_dir: str | Path, path_value: str | Path | None, default_relative: str) -> Path:
+def _is_windows_absolute(path_text: str) -> bool:
+    """True for ``C:\\...`` / ``C:/...`` even when running on POSIX."""
+    if len(path_text) >= 3 and path_text[0].isalpha() and path_text[1] == ":" and path_text[2] in "\\/":
+        return True
+    return path_text.startswith("\\\\")
+
+
+def _posix_text(path_text: str) -> str:
+    return path_text.replace("\\", "/")
+
+
+def _project_subdir_relative(path_text: str) -> str | None:
+    """
+    Recover ``scenes/scene.json``-style tails from foreign absolute paths.
+
+    Host Windows DB rows often store ``D:\\...\\projects\\15\\scenes\\scene.json``;
+    inside Linux/Docker that string is not a native absolute path.
+    """
+    normalized = _posix_text(path_text)
+    markers = (
+        "/scenes/",
+        "/artifacts/",
+        "/manifests/",
+        "/summaries/",
+        "/extracted/",
+        "/evidence_frames/",
+    )
+    lowered = normalized.lower()
+    for marker in markers:
+        index = lowered.rfind(marker)
+        if index >= 0:
+            return normalized[index + 1 :]
+    return None
+
+
+def to_project_relative_path(artifacts_dir: str | Path, path_value: str | Path) -> str:
+    """Store portable relative paths (POSIX separators) under the project root."""
     root = Path(artifacts_dir)
-    if path_value:
-        candidate = Path(path_value)
-        if candidate.is_absolute():
-            return candidate
+    absolute = Path(path_value)
+    try:
+        relative = absolute.resolve().relative_to(root.resolve())
+        return _posix_text(str(relative))
+    except Exception:
+        recovered = _project_subdir_relative(str(path_value))
+        if recovered:
+            return recovered
+        return _posix_text(str(path_value))
+
+
+def resolve_project_path(artifacts_dir: str | Path, path_value: str | Path | None, default_relative: str) -> Path:
+    """
+    Resolve a project file path portably across Windows host ↔ Linux/Docker.
+
+    Prefer an existing file under ``artifacts_dir`` (including remapped Windows
+    absolute DB values), then a native absolute path, then ``default_relative``.
+    """
+    root = Path(artifacts_dir)
+    default_path = root / default_relative
+    if not path_value:
+        return default_path
+
+    raw = str(path_value).strip()
+    if not raw:
+        return default_path
+
+    candidate = Path(raw)
+    windows_abs = _is_windows_absolute(raw)
+
+    # Portable relative values already stored as scenes/... or artifacts/...
+    if not candidate.is_absolute() and not windows_abs:
         return root / candidate
-    return root / default_relative
+
+    recovered = _project_subdir_relative(raw)
+    remapped = root / recovered if recovered else None
+    if remapped is not None and remapped.exists():
+        return remapped
+
+    # Native absolute path present on this OS (typical local Windows/Linux run).
+    if candidate.is_absolute() and candidate.exists():
+        return candidate
+
+    if remapped is not None:
+        if default_path.exists() and remapped != default_path and not remapped.exists():
+            return default_path
+        return remapped
+
+    if default_path.exists():
+        return default_path
+
+    if candidate.is_absolute() or windows_abs:
+        return candidate
+    return root / candidate
 
 
 def path_size_bytes(path: Path) -> int:

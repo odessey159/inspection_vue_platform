@@ -8,6 +8,10 @@ const props = defineProps<{
   name: string;
   bagDir: string;
   standardsDir: string;
+  selectedVehicleId?: string;
+  selectedVehicleName?: string;
+  vehicleMapStatus?: "idle" | "loading" | "ready" | "missing" | "error";
+  vehicleMapMessage?: string;
 }>();
 
 const emit = defineEmits<{
@@ -30,6 +34,21 @@ const selectedVehicle = ref<RtspVehicle | null>(null);
 
 const vehicles = computed(() => props.bootstrap?.rtsp_vehicles ?? []);
 const isRtspImport = computed(() => importSource.value === "rtsp");
+
+const mapStatusLabel = computed(() => {
+  switch (props.vehicleMapStatus) {
+    case "loading":
+      return "地图加载中";
+    case "ready":
+      return "地图已显示";
+    case "missing":
+      return "暂无地图";
+    case "error":
+      return "地图加载失败";
+    default:
+      return "";
+  }
+});
 
 function emitInput(
   event: Event,
@@ -135,7 +154,10 @@ defineExpose({ resetStep });
       <div v-if="selectedVehicle" class="selected-vehicle-banner">
         <span>已选小车</span>
         <strong>{{ selectedVehicle.name }}</strong>
+        <code>{{ selectedVehicle.id }}</code>
         <code>{{ selectedVehicle.rtsp_url }}</code>
+        <em v-if="mapStatusLabel" :data-status="vehicleMapStatus">{{ mapStatusLabel }}</em>
+        <p v-if="vehicleMapMessage" class="vehicle-map-hint">{{ vehicleMapMessage }}</p>
       </div>
       <div v-else class="selected-vehicle-banner rosbag-mode">
         <span>导入方式</span>

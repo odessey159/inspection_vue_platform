@@ -1,4 +1,9 @@
-"""RTSP recording, playback, project import, and localhost fallback for Docker."""
+"""RTSP recording, playback, project import, and localhost fallback for Docker.
+
+Recording clocks prefer ``rtsp_timeline`` (stream barcode / map origin) over wall
+clock. Scene import aligns onboard maps onto that video timeline and upgrades
+placeholder scenes when ``robots/<id>/maps/scene.json`` appears.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +32,7 @@ from ..settings import (
     YOLO_API_URL,
 )
 from .rules import export_rules_payload, parse_rules, sync_rules_to_db
-from .storage import ensure_project_dirs, path_size_bytes, read_json, write_json
+from .storage import ensure_project_dirs, path_size_bytes, read_json, resolve_project_path, to_project_relative_path, write_json
 
 
 DEFAULT_RTSP_URL = os.getenv("RTSP_DEFAULT_URL", "rtsp://127.0.0.1:18554/live").strip()
@@ -522,7 +527,16 @@ def record_rtsp_stream(
     if output_path.exists():
         output_path.unlink()
 
-    video_start_ts = _utc_now_ms()
+    from .rtsp_timeline import resolve_recording_video_start_ts, write_recording_timeline_meta
+
+    timeline = resolve_recording_video_start_ts(rtsp_url)
+    video_start_ts = timeline.timestamp_ms
+    write_recording_timeline_meta(
+        output_path,
+        video_start_ts=video_start_ts,
+        source=timeline.source,
+        rtsp_url=rtsp_url,
+    )
     command = _build_rtsp_ffmpeg_command(
         rtsp_url=rtsp_url,
         output_path=output_path,
@@ -583,7 +597,16 @@ def record_rtsp_until_disconnect(
     if not skip_server_check:
         rtsp_url = resolve_recording_rtsp_url(rtsp_url)
 
-    video_start_ts = _utc_now_ms()
+    from .rtsp_timeline import resolve_recording_video_start_ts, write_recording_timeline_meta
+
+    timeline = resolve_recording_video_start_ts(rtsp_url)
+    video_start_ts = timeline.timestamp_ms
+    write_recording_timeline_meta(
+        output_path,
+        video_start_ts=video_start_ts,
+        source=timeline.source,
+        rtsp_url=rtsp_url,
+    )
     process = spawn_record_rtsp_until_disconnect(
         rtsp_url=rtsp_url,
         output_path=output_path,
@@ -660,6 +683,34 @@ def resolve_storage_key_for_rtsp_url(rtsp_url: str) -> str:
         host = "127.0.0.1"
     path_part = (parsed.path or "/live").strip("/").replace("/", "_") or "live"
     return f"{host}_{path_part}"
+
+
+def resolve_map_vehicle_id(*, vehicle_id: str | None = None, rtsp_url: str | None = None) -> str:
+    """Prefer the selected vehicle id for map lookup; fall back to URL→storage_key."""
+    cleaned = (vehicle_id or "").strip()
+    if cleaned:
+        return cleaned
+    return resolve_storage_key_for_rtsp_url((rtsp_url or "").strip())
+
+
+def resolve_project_vehicle_id(project: Project) -> str | None:
+    """Read persisted vehicle id from the project (point_topic) or rtsp_summary.json."""
+    if project.point_topic and str(project.point_topic).strip():
+        return str(project.point_topic).strip()
+    if not project.artifacts_dir:
+        return None
+    summary_path = Path(project.artifacts_dir) / "summaries" / "rtsp_summary.json"
+    if not summary_path.is_file():
+        return None
+    try:
+        payload = read_json(summary_path)
+    except (OSError, ValueError, TypeError):
+        return None
+    raw = payload.get("vehicle_id") if isinstance(payload, dict) else None
+    if raw is None:
+        return None
+    cleaned = str(raw).strip()
+    return cleaned or None
 
 
 def list_storage_key_recordings(storage_key: str) -> list[Path]:
@@ -975,10 +1026,15 @@ def adopt_recording_for_project(
     *,
     rtsp_url: str,
     rtsp_transport: str = DEFAULT_RTSP_TRANSPORT,
+    vehicle_id: str | None = None,
 ) -> RtspRecordingResult:
     if project.id is None:
         raise RuntimeError("Project must be persisted before adopting RTSP recording")
 
+    map_vehicle_id = resolve_map_vehicle_id(
+        vehicle_id=vehicle_id or resolve_project_vehicle_id(project),
+        rtsp_url=rtsp_url,
+    )
     project_dirs = ensure_project_dirs(project.id)
     playback_path = publish_recording_to_project_artifacts(recording_path, project_dirs["artifacts"])
     recording = recording_result_from_path(
@@ -991,18 +1047,20 @@ def adopt_recording_for_project(
         recording,
         requested_duration_sec=recording.duration_sec,
         rtsp_transport=rtsp_transport,
+        vehicle_id=map_vehicle_id,
     )
 
     project.status = "indexed"
     project.bag_dir = rtsp_url
+    project.point_topic = map_vehicle_id
     project.bag_start_ts = recording.video_start_ts
     project.bag_end_ts = recording.video_end_ts
     project.bag_duration_ms = recording.video_end_ts - recording.video_start_ts
     project.message_count = 0
     project.calibration_required = False
     project.time_offset_ms = 0
-    project.scene_path = str(artifacts["scene"])
-    project.inspection_video_path = str(artifacts["inspection_video"])
+    project.scene_path = to_project_relative_path(project_dirs["root"], artifacts["scene"])
+    project.inspection_video_path = to_project_relative_path(project_dirs["root"], artifacts["inspection_video"])
     project.updated_at = datetime.now(timezone.utc)
     session.add(project)
     session.commit()
@@ -1078,13 +1136,16 @@ def materialize_rtsp_recording(
     *,
     requested_duration_sec: float | None = None,
     rtsp_transport: str = DEFAULT_RTSP_TRANSPORT,
+    vehicle_id: str | None = None,
 ) -> dict[str, Path]:
+    map_vehicle_id = resolve_map_vehicle_id(vehicle_id=vehicle_id, rtsp_url=recording.rtsp_url)
     dataset_summary = build_rtsp_dataset_summary(recording)
     video_manifest = build_rtsp_video_manifest(recording)
-    scene_payload = build_rtsp_scene_for_recording(recording)
+    scene_payload = build_rtsp_scene_for_recording(recording, vehicle_id=map_vehicle_id)
     rtsp_summary = {
         "source_type": "rtsp",
         "rtsp_url": recording.rtsp_url,
+        "vehicle_id": map_vehicle_id,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "storage_path": str(recording.output_path),
         "playback_path": str(recording.playback_path),
@@ -1214,7 +1275,11 @@ def align_scene_timestamps_to_video(
     Linearly remap trajectory timestamps onto the recorded video timeline.
 
     Clicking a trajectory point then seeks video via (ts - video_start_ts) / 1000.
+    When the map already shares the RTSP timeline epoch with the video, keep the
+    original timestamps (identity alignment) so absolute-time sync stays correct.
     """
+    from .rtsp_timeline import scene_timeline_overlaps_video
+
     start_ts = int(video_start_ts)
     end_ts = int(video_end_ts)
     if end_ts <= start_ts:
@@ -1223,6 +1288,29 @@ def align_scene_timestamps_to_video(
     timestamps_raw = scene.get("trajectory_timestamps") or []
     if not isinstance(timestamps_raw, list) or not timestamps_raw:
         scene["trajectory_timestamps"] = [start_ts, end_ts]
+    elif scene_timeline_overlaps_video(scene, start_ts, end_ts):
+        quality = scene.get("scene_quality")
+        if not isinstance(quality, dict):
+            quality = {}
+            scene["scene_quality"] = quality
+        quality["time_alignment"] = {
+            "mode": "rtsp_timeline_shared",
+            "map_start_ts": int(timestamps_raw[0]),
+            "map_end_ts": int(timestamps_raw[-1]),
+            "video_start_ts": start_ts,
+            "video_end_ts": end_ts,
+            "map_source": map_source,
+        }
+        notes = scene.get("notes")
+        if not isinstance(notes, list):
+            notes = []
+        note = "轨迹时间戳与 RTSP 视频时钟同源；按绝对时间戳同步地图与视频。"
+        if note not in notes:
+            notes = [*notes, note]
+        scene["notes"] = notes
+        if map_source:
+            scene.setdefault("source_type", "robot_map")
+        return scene
     else:
         timestamps = [int(ts) for ts in timestamps_raw]
         map_start = timestamps[0]
@@ -1274,19 +1362,24 @@ def align_scene_timestamps_to_video(
     return scene
 
 
-def build_rtsp_scene_for_recording(recording: RtspRecordingResult) -> dict[str, object]:
+def build_rtsp_scene_for_recording(
+    recording: RtspRecordingResult,
+    *,
+    vehicle_id: str | None = None,
+) -> dict[str, object]:
     """Prefer per-vehicle map under robots/<id>/maps; fall back to placeholder."""
     from .rtsp_vehicles import find_robot_map_scene, is_point_cloud_enabled
+    from .scene_transport import load_compact_scene_json
 
     if not is_point_cloud_enabled():
         return build_rtsp_placeholder_scene(recording)
 
-    storage_key = resolve_storage_key_for_rtsp_url(recording.rtsp_url)
-    map_path = find_robot_map_scene(storage_key)
+    map_vehicle_id = resolve_map_vehicle_id(vehicle_id=vehicle_id, rtsp_url=recording.rtsp_url)
+    map_path = find_robot_map_scene(map_vehicle_id)
     if map_path is None:
         return build_rtsp_placeholder_scene(recording)
 
-    payload = read_json(map_path)
+    payload = load_compact_scene_json(map_path)
     return align_scene_timestamps_to_video(
         payload,
         recording.video_start_ts,
@@ -1303,19 +1396,23 @@ def maybe_upgrade_rtsp_placeholder_scene(project: Project, scene_path: Path, pay
         return payload
 
     from .rtsp_vehicles import find_robot_map_scene, is_point_cloud_enabled
+    from .scene_transport import load_compact_scene_json
 
     if not is_point_cloud_enabled():
         return payload
 
-    storage_key = resolve_storage_key_for_rtsp_url(project.bag_dir)
-    map_path = find_robot_map_scene(storage_key)
+    map_vehicle_id = resolve_map_vehicle_id(
+        vehicle_id=resolve_project_vehicle_id(project),
+        rtsp_url=project.bag_dir,
+    )
+    map_path = find_robot_map_scene(map_vehicle_id)
     if map_path is None:
         return payload
 
     video_start = int(project.bag_start_ts or 0)
     video_end = int(project.bag_end_ts or video_start)
     aligned = align_scene_timestamps_to_video(
-        read_json(map_path),
+        load_compact_scene_json(map_path),
         video_start,
         video_end,
         map_source=str(map_path),
@@ -1370,14 +1467,27 @@ def import_rtsp_project(
     rtsp_url: str,
     standards_dir: Path,
     *,
+    vehicle_id: str | None = None,
     duration_sec: float = DEFAULT_RTSP_RECORD_SECONDS,
     rtsp_transport: str = DEFAULT_RTSP_TRANSPORT,
     skip_server_check: bool = False,
 ) -> Project:
     """Create an RTSP-backed project, parse rules, and adopt the latest completed recording."""
+    from .rtsp_vehicles import get_vehicle_by_id
+
     source_url = rtsp_url.strip()
     if not source_url.lower().startswith("rtsp://"):
         raise ValueError(f"Expected an RTSP URL, got: {source_url}")
+
+    selected_vehicle_id = (vehicle_id or "").strip() or None
+    if selected_vehicle_id:
+        vehicle = get_vehicle_by_id(selected_vehicle_id)
+        if vehicle is None:
+            raise ValueError(f"Unknown RTSP vehicle id: {selected_vehicle_id}")
+        source_url = vehicle.rtsp_url.strip()
+    else:
+        # Keep URL-based fallback for API callers that omit vehicle_id.
+        selected_vehicle_id = resolve_storage_key_for_rtsp_url(source_url)
 
     standards_dir = standards_dir.resolve()
     if not standards_dir.is_dir():
@@ -1389,6 +1499,7 @@ def import_rtsp_project(
         bag_dir=source_url,
         standards_dir=str(standards_dir),
         artifacts_dir="",
+        point_topic=selected_vehicle_id,
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
     )
@@ -1418,6 +1529,7 @@ def import_rtsp_project(
             recording_path,
             rtsp_url=source_url,
             rtsp_transport=rtsp_transport,
+            vehicle_id=selected_vehicle_id,
         )
     except Exception:
         project.status = "rtsp_failed"
@@ -1568,9 +1680,8 @@ def ensure_rtsp_videos_for_analysis(
 
 
 def _project_playback_path(project: Project, project_dirs: dict[str, Path]) -> Path:
-    if project.inspection_video_path:
-        return Path(project.inspection_video_path)
-    return project_dirs["artifacts"] / "inspection.mp4"
+    root = Path(project.artifacts_dir) if project.artifacts_dir else project_dirs["root"]
+    return resolve_project_path(root, project.inspection_video_path, "artifacts/inspection.mp4")
 
 
 def _parse_frame_rate(value: str) -> float:
@@ -1681,6 +1792,12 @@ def release_stream_recording_lock(lock_path: Path | None) -> None:
 
 
 def _recording_start_ts(recording_path: Path) -> int:
+    from .rtsp_timeline import read_recording_timeline_meta
+
+    meta = read_recording_timeline_meta(recording_path)
+    if meta is not None and meta.timestamp_ms > 0:
+        return meta.timestamp_ms
+
     stem = recording_path.stem
     if stem.startswith("recording_"):
         raw = stem[len("recording_") :]

@@ -1,4 +1,6 @@
-﻿from __future__ import annotations
+﻿"""Project import orchestration for rosbag directories and RTSP vehicle streams."""
+
+from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +22,7 @@ from .rtsp_watchdog import rtsp_watch_settings_payload
 from .runtime import compact_project_runtime
 from .rules import export_rules_payload, parse_rules, sync_rules_to_db
 from .scene import build_scene
-from .storage import ensure_project_dirs, read_json, write_json
+from .storage import ensure_project_dirs, read_json, to_project_relative_path, write_json
 from .video import build_video
 
 SAMPLE_SCENE_PATH = Path(__file__).resolve().parents[2] / "tests" / "pcd" / "scene.json"
@@ -178,7 +180,7 @@ def import_static_scene_project(session: Session, name: str, scene_source: Path,
         project.calibration_required = False
         project.time_offset_ms = 0
         project.rules_path = str(rules_path)
-        project.scene_path = str(scene_path)
+        project.scene_path = to_project_relative_path(project_dirs["root"], scene_path)
         project.inspection_video_path = None
         project.updated_at = datetime.now(timezone.utc)
 
@@ -303,8 +305,8 @@ def import_project(session: Session, name: str, bag_dir: Path, standards_dir: Pa
         project.time_offset_ms = int(dataset_summary["time_offset_ms"])
         project.rosbag_summary_path = str(rosbag_summary_path)
         project.rules_path = str(rules_path)
-        project.scene_path = str(scene_path)
-        project.inspection_video_path = str(video_output_path)
+        project.scene_path = to_project_relative_path(project_dirs["root"], scene_path)
+        project.inspection_video_path = to_project_relative_path(project_dirs["root"], video_output_path)
         project.updated_at = datetime.now(timezone.utc)
 
         session.add(project)

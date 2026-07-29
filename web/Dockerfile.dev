@@ -1,0 +1,14 @@
+# Vite HMR image for docker-compose web service (host :8700 -> container :5173).
+FROM node:20-alpine
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY docker-entrypoint.dev.sh /docker-entrypoint.dev.sh
+RUN chmod +x /docker-entrypoint.dev.sh
+
+EXPOSE 5173
+
+ENTRYPOINT ["/docker-entrypoint.dev.sh"]

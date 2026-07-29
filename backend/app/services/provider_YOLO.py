@@ -58,7 +58,7 @@ from .rtsp_recorder import (
     wait_for_completed_recording,
 )
 from .rules import export_rules_payload
-from .storage import read_json, remove_paths
+from .storage import read_json, remove_paths, resolve_project_path
 
 
 class YoloDetectionPayload(BaseModel):
@@ -336,10 +336,11 @@ def run_provider_yolo_analysis(
         return _result(status, [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)
     _append_vision_provider_warning(notes, selected_model)
 
-    resolved_video_path = video_path or (Path(project.inspection_video_path) if project.inspection_video_path else None)
-    if resolved_video_path is None:
-        diagnostics.append("Project video is missing")
-        return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)
+    resolved_video_path = video_path or resolve_project_path(
+        project.artifacts_dir or "",
+        project.inspection_video_path,
+        "artifacts/inspection.mp4",
+    )
     if not resolved_video_path.exists():
         diagnostics.append(f"Project video not found: {resolved_video_path}")
         return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)

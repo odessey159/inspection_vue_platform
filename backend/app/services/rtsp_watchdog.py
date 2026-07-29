@@ -1,4 +1,8 @@
-"""Background poll loop that records RTSP vehicles and triggers live analysis."""
+"""Background poll loop that records RTSP vehicles and triggers live analysis.
+
+On stream-up it starts recording (with RTSP timeline meta), optionally runs the
+YOLO live monitor, and can schedule auto analysis when the stream settles.
+"""
 
 from __future__ import annotations
 
@@ -70,6 +74,7 @@ class _ActiveSession:
     process: subprocess.Popen[str]
     started_at: datetime
     lock_path: Path | None = None
+    timeline_start_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -90,7 +95,9 @@ def get_active_recording(storage_key: str) -> ActiveRecordingInfo | None:
             return None
         from .rtsp_recorder import _recording_start_ts
 
-        started_at_ms = _recording_start_ts(session.output_path)
+        started_at_ms = session.timeline_start_ms
+        if started_at_ms <= 0:
+            started_at_ms = _recording_start_ts(session.output_path)
         if started_at_ms <= 0:
             started_at_ms = int(session.started_at.timestamp() * 1000)
         return ActiveRecordingInfo(
@@ -269,6 +276,17 @@ def _poll_vehicle(storage_key: str, configured_url: str) -> None:
 
         max_duration_sec = RTSP_WATCH_TEST_MAX_SECONDS if is_rtsp_watch_test_mode() else None
         output_path = build_rtsp_recording_path_for_storage_key(storage_key)
+
+        from .rtsp_timeline import resolve_recording_video_start_ts, write_recording_timeline_meta
+
+        timeline = resolve_recording_video_start_ts(rtsp_url)
+        write_recording_timeline_meta(
+            output_path,
+            video_start_ts=timeline.timestamp_ms,
+            source=timeline.source,
+            rtsp_url=rtsp_url,
+        )
+
         process = spawn_record_rtsp_until_disconnect(
             rtsp_url=rtsp_url,
             output_path=output_path,
@@ -281,6 +299,7 @@ def _poll_vehicle(storage_key: str, configured_url: str) -> None:
             process=process,
             started_at=datetime.now(timezone.utc),
             lock_path=lock_path,
+            timeline_start_ms=timeline.timestamp_ms,
         )
         with _lock:
             _active_by_key[storage_key] = session

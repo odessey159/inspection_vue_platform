@@ -13,7 +13,7 @@ from .import_pipeline import _resolve_pose_path, _resolve_pose_validity_path, pr
 from .rosbag import is_rosbag_dir
 from .runtime import compact_project_runtime
 from .scene import build_scene
-from .storage import resolve_project_path, write_json
+from .storage import resolve_project_path, to_project_relative_path, write_json
 
 
 def rebuild_project_scene(session: Session, project: Project) -> dict[str, object]:
@@ -61,7 +61,7 @@ def rebuild_project_scene(session: Session, project: Project) -> dict[str, objec
     write_json(runtime_paths["dataset_summary"], dataset_summary)
 
     project.pose_topic = pose_topic
-    project.scene_path = str(scene_path)
+    project.scene_path = to_project_relative_path(project.artifacts_dir, scene_path)
     project.time_offset_ms = int(dataset_summary["time_offset_ms"])
     project.updated_at = datetime.now(timezone.utc)
     session.add(project)

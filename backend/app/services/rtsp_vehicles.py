@@ -1,4 +1,8 @@
-"""Load configured RTSP inspection vehicles from rtsp_vehicles.yaml."""
+"""Load configured RTSP inspection vehicles from rtsp_vehicles.yaml.
+
+Also manages per-vehicle runtime dirs under ``.runtime/robots/<id>/`` for
+recordings and onboard ``maps/scene.json`` preview.
+"""
 
 from __future__ import annotations
 
@@ -115,9 +119,22 @@ def ensure_robot_runtime_dirs(vehicles: list[RtspVehicle] | None = None) -> list
 
 def find_robot_map_scene(vehicle_id: str) -> Path | None:
     """Return robots/<id>/maps/scene.json when present."""
-    scene_path = robot_runtime_paths(vehicle_id).maps / "scene.json"
+    cleaned = vehicle_id.strip()
+    if not cleaned:
+        return None
+    scene_path = robot_runtime_paths(cleaned).maps / "scene.json"
     if scene_path.is_file():
         return scene_path
+    return None
+
+
+def get_vehicle_by_id(vehicle_id: str) -> RtspVehicle | None:
+    cleaned = vehicle_id.strip()
+    if not cleaned:
+        return None
+    for vehicle in load_rtsp_vehicles():
+        if vehicle.id == cleaned:
+            return vehicle
     return None
 
 

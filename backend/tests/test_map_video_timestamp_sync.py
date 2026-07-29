@@ -30,6 +30,49 @@ class MapVideoTimestampSyncTests(unittest.TestCase):
         self.assertEqual(aligned["hazard_zones"][0]["related_pose_ts"], 11_000)
         self.assertEqual(aligned["scene_quality"]["time_alignment"]["mode"], "linear_map_to_video")
 
+    def test_build_rtsp_scene_uses_selected_vehicle_map(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            robots_root = Path(tmp_dir) / "robots"
+            with patch("app.services.rtsp_vehicles.ROBOTS_DIR", robots_root):
+                for vehicle_id, marker_x in (("local-demo", 0.0), ("vehicle-02", 2.0)):
+                    maps_dir = robot_runtime_paths(vehicle_id).maps
+                    maps_dir.mkdir(parents=True)
+                    write_json(
+                        maps_dir / "scene.json",
+                        {
+                            "points": [[marker_x, 0, 0, 1]],
+                            "render_points": [[marker_x, 0, 0, 1]],
+                            "trajectory": [[marker_x, 0, 0], [marker_x + 1, 0, 0]],
+                            "trajectory_timestamps": [100, 300],
+                            "trajectory_orientations": [[0, 0, 0, 1], [0, 0, 0, 1]],
+                            "bounds": {"min": [0, 0, 0], "max": [1, 1, 1]},
+                            "source_type": "pcd_accumulated_lidar_structure",
+                            "notes": [],
+                            "scene_quality": {},
+                        },
+                    )
+
+                recording = RtspRecordingResult(
+                    rtsp_url="rtsp://127.0.0.1:18554/live",
+                    output_path=Path(tmp_dir) / "recording.mp4",
+                    playback_path=Path(tmp_dir) / "inspection.mp4",
+                    duration_sec=20.0,
+                    fps=10.0,
+                    frame_count=200,
+                    video_start_ts=50_000,
+                    video_end_ts=70_000,
+                )
+                with patch(
+                    "app.services.rtsp_recorder.resolve_storage_key_for_rtsp_url",
+                    return_value="local-demo",
+                ):
+                    scene = build_rtsp_scene_for_recording(recording, vehicle_id="vehicle-02")
+
+            self.assertEqual(scene["source_type"], "pcd_accumulated_lidar_structure")
+            self.assertEqual(scene["render_points"][0][0], 2.0)
+            self.assertEqual(scene["trajectory_timestamps"], [50_000, 70_000])
+            self.assertIn("vehicle-02", str(scene["scene_quality"]["time_alignment"]["map_source"]))
+
     def test_build_rtsp_scene_uses_robot_map_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             robots_root = Path(tmp_dir) / "robots"

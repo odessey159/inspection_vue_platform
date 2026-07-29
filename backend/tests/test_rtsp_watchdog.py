@@ -9,6 +9,17 @@ from unittest.mock import patch
 runpy.run_path(str(Path(__file__).with_name("_bootstrap.py")))
 
 from app.services import rtsp_recorder, rtsp_watchdog
+from app.services.rtsp_timeline import RtspTimelineSample
+
+
+_FAKE_RTSP_TIMELINE = RtspTimelineSample(timestamp_ms=1_774_328_748_518, source="rtsp_time_barcode")
+
+
+def _patch_rtsp_timeline_resolve():
+    return patch(
+        "app.services.rtsp_timeline.resolve_recording_video_start_ts",
+        return_value=_FAKE_RTSP_TIMELINE,
+    )
 
 
 class RtspRecorderHelpersTest(unittest.TestCase):
@@ -302,7 +313,9 @@ class RtspRecorderHelpersTest(unittest.TestCase):
                                 with patch("app.services.rtsp_watchdog.release_stream_recording_lock"):
                                     with patch("app.services.rtsp_watchdog.spawn_record_rtsp_until_disconnect") as spawn_mock:
                                         spawn_mock.return_value.poll.return_value = None
-                                        rtsp_watchdog._poll_vehicle("local-demo", "rtsp://127.0.0.1:18554/live")
+                                        with _patch_rtsp_timeline_resolve():
+                                            with patch("app.services.rtsp_timeline.write_recording_timeline_meta"):
+                                                rtsp_watchdog._poll_vehicle("local-demo", "rtsp://127.0.0.1:18554/live")
         prune_mock.assert_called_once_with("local-demo", max_recordings=5)
         spawn_mock.assert_called_once()
 
@@ -322,7 +335,9 @@ class RtspRecorderHelpersTest(unittest.TestCase):
                                     with patch("app.services.rtsp_watchdog.release_stream_recording_lock"):
                                         with patch("app.services.rtsp_watchdog.spawn_record_rtsp_until_disconnect") as spawn_mock:
                                             spawn_mock.return_value.poll.return_value = None
-                                            rtsp_watchdog._poll_vehicle("local-demo", "rtsp://127.0.0.1:18554/live")
+                                            with _patch_rtsp_timeline_resolve():
+                                                with patch("app.services.rtsp_timeline.write_recording_timeline_meta"):
+                                                    rtsp_watchdog._poll_vehicle("local-demo", "rtsp://127.0.0.1:18554/live")
         spawn_mock.assert_called_once()
         self.assertEqual(spawn_mock.call_args.kwargs["max_duration_sec"], 600.0)
 

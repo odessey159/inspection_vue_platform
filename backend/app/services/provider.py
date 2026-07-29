@@ -31,7 +31,7 @@ from ..settings import (
 )
 from .analysis_types import AnalysisRunResult, FindingSeed
 from .llm_output_log import write_llm_log
-from .storage import read_json, remove_paths
+from .storage import read_json, remove_paths, resolve_project_path
 
 
 @dataclass
@@ -95,10 +95,11 @@ def run_provider_analysis(
         diagnostics.append(f"Model is not in the configured supported list: {selected_model}")
         return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)
 
-    resolved_video_path = video_path or (Path(project.inspection_video_path) if project.inspection_video_path else None)
-    if resolved_video_path is None:
-        diagnostics.append("Project video is missing")
-        return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)
+    resolved_video_path = video_path or resolve_project_path(
+        project.artifacts_dir or "",
+        project.inspection_video_path,
+        "artifacts/inspection.mp4",
+    )
     if not resolved_video_path.exists():
         diagnostics.append(f"Project video not found: {resolved_video_path}")
         return _result("provider_failed", [], diagnostics, notes, clip_count=0, successful_clips=0, selected_model=selected_model)

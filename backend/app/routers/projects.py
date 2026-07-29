@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -47,6 +48,8 @@ from ..services.rtsp_recorder import (
     summarize_rtsp_playback_fields,
 )
 from ..services.rtsp_vehicles import (
+    find_robot_map_scene,
+    get_vehicle_by_id,
     is_point_cloud_enabled,
     point_cloud_settings_payload,
     set_point_cloud_enabled,
@@ -56,7 +59,8 @@ from ..services.rtsp_yolo_monitor import start_rtsp_yolo_monitor, stop_rtsp_yolo
 from ..services.rtsp_live import MJPEG_BOUNDARY, iter_mjpeg_multipart_frames
 from ..services.scene_rebuild import rebuild_project_scene
 from ..services.sfm_reconstruction import rebuild_project_sfm_scene, sfm_scene_exists, sfm_scene_path
-from ..services.storage import read_json, resolve_project_path
+from ..services.storage import read_json, resolve_project_path, to_project_relative_path
+from ..services.scene_transport import compact_scene_payload, load_compact_scene_json
 
 
 router = APIRouter(prefix="/api", tags=["projects"])
@@ -143,6 +147,45 @@ def get_latest_rtsp_recording(storage_key: str) -> FileResponse:
     return FileResponse(recording_path, media_type="video/mp4", filename=recording_path.name)
 
 
+@router.get("/rtsp-vehicles/{vehicle_id}/scene", response_model=SceneResponse)
+def get_vehicle_scene(vehicle_id: str) -> SceneResponse:
+    """Load the selected vehicle's onboard map for immediate frontend preview."""
+    cleaned = vehicle_id.strip()
+    if not cleaned or cleaned in {".", ".."} or "/" in cleaned or "\\" in cleaned:
+        raise HTTPException(status_code=400, detail="Invalid vehicle id")
+    if not is_point_cloud_enabled():
+        raise HTTPException(status_code=404, detail="Point cloud map is disabled")
+    vehicle = get_vehicle_by_id(cleaned)
+    if vehicle is None:
+        raise HTTPException(status_code=404, detail=f"Unknown RTSP vehicle id: {cleaned}")
+    map_path = find_robot_map_scene(vehicle.id)
+    if map_path is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No scene.json map found for vehicle '{vehicle.id}' under robots/{vehicle.id}/maps/",
+        )
+
+    try:
+        payload = load_compact_scene_json(map_path)
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid vehicle map scene.json: {exc}") from exc
+    notes = list(payload.get("notes", [])) if isinstance(payload.get("notes"), list) else []
+    preview_note = f"已加载车端地图：{vehicle.name}（{vehicle.id}）"
+    if preview_note not in notes:
+        notes = [preview_note, *notes]
+    payload = {**payload, "notes": notes}
+    quality = payload.get("scene_quality")
+    if not isinstance(quality, dict):
+        quality = {}
+    payload["scene_quality"] = {
+        **quality,
+        "vehicle_id": vehicle.id,
+        "vehicle_name": vehicle.name,
+        "map_source": str(map_path),
+    }
+    return _scene_response_from_payload(payload, project_id=0)
+
+
 @router.get("/projects", response_model=list[ProjectSummary])
 def get_projects(session: Session = Depends(get_session)) -> list[ProjectSummary]:
     return [_project_summary(project) for project in list_projects(session)]
@@ -158,6 +201,7 @@ def post_import_project(payload: ProjectImportRequest, session: Session = Depend
                 name=payload.name,
                 rtsp_url=source,
                 standards_dir=Path(payload.standards_dir),
+                vehicle_id=payload.vehicle_id,
                 duration_sec=payload.rtsp_duration_sec or 60,
                 rtsp_transport=payload.rtsp_transport or "tcp",
             )
@@ -230,43 +274,22 @@ def get_scene(
     scene_path = _scene_path_for_source(project, source)
     if scene_path is None or not scene_path.exists():
         raise HTTPException(status_code=404, detail="Project scene not found")
-    payload = read_json(scene_path)
+    payload = compact_scene_payload(read_json(scene_path))
     if source == "lidar":
         payload = maybe_upgrade_rtsp_placeholder_scene(project, scene_path, payload)
+        payload = compact_scene_payload(payload)
+        # Persist portable relative paths so Docker/Linux keeps working after a Windows host write.
+        relative_scene = to_project_relative_path(project.artifacts_dir, scene_path)
+        if project.scene_path != relative_scene:
+            project.scene_path = relative_scene
+            project.updated_at = datetime.now(timezone.utc)
+            session.add(project)
+            session.commit()
     zones = list(session.exec(select(HazardZone).where(HazardZone.project_id == project_id)))
-    return SceneResponse(
+    return _scene_response_from_payload(
+        payload,
         project_id=project_id,
-        scene_source=payload.get("scene_source", source),
-        reconstruction_method=payload.get("reconstruction_method", "lidar_projection" if source == "lidar" else "colmap_sfm_mvs"),
-        points=payload.get("points", []),
-        full_points=payload.get("full_points", payload.get("points", [])),
-        roof_removed_points=payload.get("roof_removed_points", payload.get("points", [])),
-        floor_removed_points=payload.get("floor_removed_points", payload.get("points", [])),
-        structure_points=payload.get("structure_points", payload.get("render_points", [])),
-        render_points=payload.get("render_points", []),
-        default_point_mode=payload.get("default_point_mode", "roof_removed" if payload.get("roof_removed_points") else "full"),
-        trajectory=payload.get("trajectory", []),
-        trajectory_timestamps=payload.get("trajectory_timestamps", []),
-        trajectory_orientations=payload.get("trajectory_orientations", []),
-        bounds=payload.get("bounds", {"min": [0.0, 0.0, 0.0], "max": [0.0, 0.0, 0.0]}),
-        full_bounds=payload.get("full_bounds", payload.get("bounds", {"min": [0.0, 0.0, 0.0], "max": [0.0, 0.0, 0.0]})),
-        roof_removed_bounds=payload.get("roof_removed_bounds", payload.get("bounds", {"min": [0.0, 0.0, 0.0], "max": [0.0, 0.0, 0.0]})),
-        source_frame_count=payload.get("source_frame_count", 0),
-        coordinate_frame=payload.get("coordinate_frame", "sensor_local"),
-        source_type=payload.get("source_type", "unknown"),
-        raw_point_count=payload.get("raw_point_count", len(payload.get("points", []))),
-        render_point_count=payload.get("render_point_count", len(payload.get("render_points", []))),
-        structure_point_count=int(payload.get("structure_point_count", len(payload.get("structure_points", [])))),
-        colorized=bool(payload.get("colorized", False)),
-        color_source=str(payload.get("color_source", "structure_enhanced")),
-        cut_height_default=float(payload.get("cut_height_default", 0.0)),
-        floor_cut_default=float(payload.get("floor_cut_default", 0.0)),
-        scene_quality=payload.get("scene_quality", {}),
-        selected_image_count=int(payload.get("selected_image_count", 0)),
-        registered_image_count=int(payload.get("registered_image_count", 0)),
-        alignment_status=str(payload.get("alignment_status", "not_applicable")),
-        alignment_rmse_m=_safe_float(payload.get("alignment_rmse_m")),
-        notes=payload.get("notes", []),
+        source=source,
         hazard_zones=[_zone_response(zone) for zone in zones],
     )
 
@@ -360,7 +383,11 @@ def _project_summary(project: Project) -> ProjectSummary:
     runtime_paths = project_runtime_paths(project)
     dataset_summary = read_json(runtime_paths["dataset_summary"]) if runtime_paths["dataset_summary"].exists() else {}
     analysis_summary = read_analysis_summary(project)
-    scene_url = f"/api/projects/{project.id}/scene" if project.scene_path else None
+    scene_url = None
+    if project.id is not None:
+        lidar_path = resolve_project_path(project.artifacts_dir or "", project.scene_path, "scenes/scene.json")
+        if lidar_path.exists() or project.scene_path:
+            scene_url = f"/api/projects/{project.id}/scene"
     inspection_video_url = resolve_inspection_video_url(project)
     rtsp_live_url = None
     rtsp_recording_active = False
@@ -430,14 +457,69 @@ def _scene_path_for_source(project: Project, source: Literal["lidar", "sfm"]) ->
     if source == "sfm":
         path = sfm_scene_path(project)
         return path if path.exists() else None
-    if not project.scene_path:
+    if not project.artifacts_dir and not project.scene_path:
         return None
-    return resolve_project_path(project.artifacts_dir, project.scene_path, "scenes/scene.json")
+    path = resolve_project_path(project.artifacts_dir or "", project.scene_path, "scenes/scene.json")
+    return path if path.exists() else None
+
+
+def _scene_response_from_payload(
+    payload: dict,
+    *,
+    project_id: int,
+    source: Literal["lidar", "sfm"] = "lidar",
+    hazard_zones: list[ZoneResponse] | None = None,
+) -> SceneResponse:
+    return SceneResponse(
+        project_id=project_id,
+        scene_source=payload.get("scene_source", source),
+        reconstruction_method=payload.get(
+            "reconstruction_method",
+            "lidar_projection" if source == "lidar" else "colmap_sfm_mvs",
+        ),
+        points=payload.get("points", []),
+        full_points=payload.get("full_points", payload.get("points", [])),
+        roof_removed_points=payload.get("roof_removed_points", payload.get("points", [])),
+        floor_removed_points=payload.get("floor_removed_points", payload.get("points", [])),
+        structure_points=payload.get("structure_points", payload.get("render_points", [])),
+        render_points=payload.get("render_points", []),
+        default_point_mode=payload.get(
+            "default_point_mode",
+            "roof_removed" if payload.get("roof_removed_points") else "full",
+        ),
+        trajectory=payload.get("trajectory", []),
+        trajectory_timestamps=payload.get("trajectory_timestamps", []),
+        trajectory_orientations=payload.get("trajectory_orientations", []),
+        bounds=payload.get("bounds", {"min": [0.0, 0.0, 0.0], "max": [0.0, 0.0, 0.0]}),
+        full_bounds=payload.get("full_bounds", payload.get("bounds", {"min": [0.0, 0.0, 0.0], "max": [0.0, 0.0, 0.0]})),
+        roof_removed_bounds=payload.get(
+            "roof_removed_bounds",
+            payload.get("bounds", {"min": [0.0, 0.0, 0.0], "max": [0.0, 0.0, 0.0]}),
+        ),
+        source_frame_count=payload.get("source_frame_count", 0),
+        coordinate_frame=payload.get("coordinate_frame", "sensor_local"),
+        source_type=payload.get("source_type", "unknown"),
+        raw_point_count=payload.get("raw_point_count", len(payload.get("points", []))),
+        render_point_count=payload.get("render_point_count", len(payload.get("render_points", []))),
+        structure_point_count=int(payload.get("structure_point_count", len(payload.get("structure_points", [])))),
+        colorized=bool(payload.get("colorized", False)),
+        color_source=str(payload.get("color_source", "structure_enhanced")),
+        cut_height_default=float(payload.get("cut_height_default", 0.0)),
+        floor_cut_default=float(payload.get("floor_cut_default", 0.0)),
+        scene_quality=payload.get("scene_quality", {}),
+        selected_image_count=int(payload.get("selected_image_count", 0)),
+        registered_image_count=int(payload.get("registered_image_count", 0)),
+        alignment_status=str(payload.get("alignment_status", "not_applicable")),
+        alignment_rmse_m=_safe_float(payload.get("alignment_rmse_m")),
+        notes=payload.get("notes", []),
+        hazard_zones=hazard_zones or [],
+    )
 
 
 def _available_scene_sources(project: Project) -> list[Literal["lidar", "sfm"]]:
     sources: list[Literal["lidar", "sfm"]] = []
-    if project.scene_path and resolve_project_path(project.artifacts_dir, project.scene_path, "scenes/scene.json").exists():
+    lidar_path = resolve_project_path(project.artifacts_dir or "", project.scene_path, "scenes/scene.json")
+    if lidar_path.exists():
         sources.append("lidar")
     if sfm_scene_exists(project):
         sources.append("sfm")

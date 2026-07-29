@@ -2,6 +2,7 @@
 
 Main live path: each segment runs YOLO, then captures a short clip for the LLM
 by cutting from the watchdog long recording (fallback: lightweight RTSP ``-c copy``).
+Segment clocks use the same ``video_start_ts`` origin as the long recording timeline.
 """
 
 from __future__ import annotations

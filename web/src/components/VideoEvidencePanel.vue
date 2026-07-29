@@ -113,18 +113,20 @@ const fallbackPlaybackUrl = computed(() => {
 });
 
 /**
- * Only show live once the MJPEG preview has a real first frame.
- * Until then keep recorded/artifact playback so false-positive online polls do not flicker.
+ * Playback source selection:
+ * - live only after MJPEG has a real first frame (avoids false-positive flicker)
+ * - otherwise prefer project inspection.mp4 (clock matches trajectory timestamps)
+ * - then fall back to the latest RTSP recording
  */
 const playbackMode = computed<RtspPlaybackMode>(() => {
   if (backendWantsLive.value && liveStreamReady.value && livePlaybackUrl.value) {
     return "live";
   }
-  if (resolveRecordedPlaybackUrl()) {
-    return "recorded";
-  }
   if (resolveArtifactPlaybackUrl()) {
     return "artifact";
+  }
+  if (resolveRecordedPlaybackUrl()) {
+    return "recorded";
   }
   return "empty";
 });
@@ -347,15 +349,21 @@ watch(
 watch(
   [
     () => playbackUrl.value,
-    () => props.project?.video_start_ts,
+    () => playbackSourceStartTs.value,
     () => props.requestedSeekTs,
     () => playbackMode.value,
   ],
   () => {
-    if (playbackMode.value === "live" || !videoRef.value || !props.project?.video_start_ts || props.requestedSeekTs === null) {
+    const sourceStartTs = playbackSourceStartTs.value;
+    if (
+      playbackMode.value === "live"
+      || !videoRef.value
+      || sourceStartTs === null
+      || props.requestedSeekTs === null
+    ) {
       return;
     }
-    const seconds = Math.max(0, (props.requestedSeekTs - props.project.video_start_ts) / 1000);
+    const seconds = Math.max(0, (props.requestedSeekTs - sourceStartTs) / 1000);
     const applySeek = () => {
       if (videoRef.value) {
         seekVideo(seconds);
@@ -440,17 +448,19 @@ function seekVideo(seconds: number) {
 let lastPlaybackTimeEmitMs = 0;
 const PLAYBACK_TIME_THROTTLE_MS = 200;
 
-function handlePlaybackTimeUpdate() {
-  if (playbackMode.value === "live" || !videoRef.value || !props.project?.video_start_ts) {
+function handlePlaybackTimeUpdate(force = false) {
+  const sourceStartTs = playbackSourceStartTs.value;
+  if (playbackMode.value === "live" || !videoRef.value || sourceStartTs === null) {
     emit("playbackTimeChange", null);
     return;
   }
   const now = performance.now();
-  if (now - lastPlaybackTimeEmitMs < PLAYBACK_TIME_THROTTLE_MS) {
+  if (!force && now - lastPlaybackTimeEmitMs < PLAYBACK_TIME_THROTTLE_MS) {
     return;
   }
   lastPlaybackTimeEmitMs = now;
-  const timestampMs = props.project.video_start_ts + videoRef.value.currentTime * 1000;
+  // Absolute timeline: video_start_ts + elapsed — must match trajectory_timestamps.
+  const timestampMs = sourceStartTs + videoRef.value.currentTime * 1000;
   emit("playbackTimeChange", timestampMs);
 }
 </script>
@@ -488,7 +498,9 @@ function handlePlaybackTimeUpdate() {
         preload="metadata"
         @error="handleVideoError"
         @loadeddata="handleVideoLoaded"
-        @timeupdate="handlePlaybackTimeUpdate"
+        @timeupdate="handlePlaybackTimeUpdate()"
+        @seeked="handlePlaybackTimeUpdate(true)"
+        @play="handlePlaybackTimeUpdate(true)"
       />
       <div v-if="showConnectingOverlay || videoLoading" class="video-status-hint">
         {{

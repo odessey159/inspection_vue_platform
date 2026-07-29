@@ -89,19 +89,21 @@ const host = ref<HTMLDivElement | null>(null);
 const viewPreset = ref<ViewPreset>("perspective");
 const showRenderControls = ref(false);
 const showPathPoints = ref(true);
+/** Fade point cloud / backdrop so the trajectory stays readable. */
+const dimNonTrajectory = ref(false);
 const fullHeightMode = ref(true);
 const viewportHint = ref("");
 const renderError = ref("");
 const cutHeightM = ref(0);
 const floorCutHeightM = ref(0);
 const pointSizeScale = ref(0.82);
-const pointDensityScale = ref(2.75);
-const autoPointAggregation = ref(true);
-const autoPointDensityScale = ref(2.75);
-const structureClarity = ref(1.15);
+const pointDensityScale = ref(2.0);
+const autoPointAggregation = ref(false);
+const autoPointDensityScale = ref(2.0);
+const structureClarity = ref(1.0);
 const colorMode = ref<ColorMode>("inverseIntensityRainbow");
-const edlEnabled = ref(true);
-const surfaceFillEnabled = ref(true);
+const edlEnabled = ref(false);
+const surfaceFillEnabled = ref(false);
 const lastSelectionStats = ref<PointSelectionStats | null>(null);
 
 let renderer: THREE.WebGLRenderer | null = null;
@@ -118,11 +120,15 @@ const edlAvailable = ref(true);
 let selectableMeshes: THREE.Mesh[] = [];
 let zoneVisuals: ZoneVisual[] = [];
 let playbackMarker: THREE.Mesh | null = null;
+let pathProgressLine: THREE.Line | null = null;
+let pathProgressIndex = -1;
+let pointCloudObject: THREE.Points | null = null;
+let dimmableMaterials: Array<{ material: THREE.Material; baseOpacity: number }> = [];
+const TRAJECTORY_DIM_OPACITY = 0.14;
 let cachedSceneMetrics: { min: THREE.Vector3; max: THREE.Vector3; center: THREE.Vector3; span: number } | null = null;
 let animationId = 0;
 let transition: CameraTransition | null = null;
 let resizeObserver: ResizeObserver | null = null;
-let autoAggregationCheckAt = 0;
 let autoAggregationTimer = 0;
 let viewportHintTimer = 0;
 let rebuildTimer = 0;
@@ -130,6 +136,8 @@ let deferredDenseRenderTimer = 0;
 let pendingReframeCamera = false;
 let suppressRebuildWatchers = false;
 let denseRenderReady = false;
+let needsRender = true;
+let interactionActive = false;
 let selectionCache:
   | {
       sceneData: SceneResponse;
@@ -142,12 +150,15 @@ let selectionCache:
     }
   | null = null;
 
-const clock = new THREE.Clock();
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
-const percentileSampleLimit = 22000;
-const fastInitialPointThreshold = 180000;
-const fastInitialPointTarget = 140000;
+const percentileSampleLimit = 12000;
+const fastInitialPointThreshold = 50000;
+/** Cap source points fed into aggregation — keep orbit/zoom interactive. */
+const maxRenderSourcePoints = 48000;
+const fastInitialPointTarget = 32000;
+const interactiveNeighborThreshold = 28000;
+const fastDisplayPointThreshold = 20000;
 const faceNeighborOffsets: Array<[number, number, number]> = [
   [1, 0, 0],
   [-1, 0, 0],
@@ -314,16 +325,20 @@ function sampleHasRgb(points: ScenePoint[]) {
   return false;
 }
 
-function limitInitialRenderPoints(points: ScenePoint[]) {
-  if (points.length <= fastInitialPointTarget) {
+function limitInitialRenderPoints(points: ScenePoint[], target = fastInitialPointTarget) {
+  if (points.length <= target) {
     return points;
   }
-  const stride = Math.max(1, Math.ceil(points.length / fastInitialPointTarget));
+  const stride = Math.max(1, Math.ceil(points.length / target));
   const limited: ScenePoint[] = [];
   for (let index = 0; index < points.length; index += stride) {
     limited.push(points[index]);
   }
   return limited;
+}
+
+function markNeedsRender() {
+  needsRender = true;
 }
 
 function quantizeDensityScale(value: number) {
@@ -494,17 +509,18 @@ function getPointSelection(sceneData: SceneResponse): PointSelection {
     return selectionCache.selection;
   }
 
-  const sourcePoints = getSourcePoints(sceneData);
+  const sourcePoints = limitInitialRenderPoints(getSourcePoints(sceneData), maxRenderSourcePoints);
   const backendPoints = sceneData.structure_points.length > 0 ? sceneData.structure_points : sceneData.render_points;
   if (isDefaultCut(sceneData) && backendPoints.length > 0) {
     const denseSourcePoints = getDenseSourcePoints(sceneData);
+    const cappedDense = limitInitialRenderPoints(denseSourcePoints, maxRenderSourcePoints);
     const shouldUseFastBackend =
       !denseRenderReady && fullHeightMode.value && denseSourcePoints.length > fastInitialPointThreshold;
     const aggregationSource = shouldUseFastBackend
-      ? limitInitialRenderPoints(backendPoints.length > 0 ? backendPoints : denseSourcePoints)
-      : denseSourcePoints.length > 0
-        ? denseSourcePoints
-        : backendPoints;
+      ? limitInitialRenderPoints(backendPoints.length > 0 ? backendPoints : cappedDense, fastInitialPointTarget)
+      : cappedDense.length > 0
+        ? cappedDense
+        : limitInitialRenderPoints(backendPoints, maxRenderSourcePoints);
     const renderPoints = buildDisplayPoints(aggregationSource);
     const selection = {
       sourcePoints: aggregationSource.length > 0 ? aggregationSource : sourcePoints,
@@ -529,7 +545,8 @@ function getPointSelection(sceneData: SceneResponse): PointSelection {
       selection,
     };
     if (shouldUseFastBackend) {
-      scheduleDeferredDenseRender();
+      // Keep the capped fast cloud — upgrading to full density freezes interaction.
+      denseRenderReady = true;
     }
     return selection;
   }
@@ -609,6 +626,55 @@ function computeBounds(points: ScenePoint[], trajectory: [number, number, number
 }
 
 function buildDisplayPoints(points: ScenePoint[]) {
+  const capped = limitInitialRenderPoints(points, maxRenderSourcePoints);
+  // Fast path: skip voxel+neighbor graph for large clouds (main source of zoom hitch).
+  if (capped.length >= fastDisplayPointThreshold || interactionActive) {
+    return buildDisplayPointsFast(capped);
+  }
+  return buildDisplayPointsDetailed(capped);
+}
+
+function buildDisplayPointsFast(points: ScenePoint[]): DisplayPoint[] {
+  const result: DisplayPoint[] = new Array(points.length);
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+  let minI = Number.POSITIVE_INFINITY;
+  let maxI = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    const intensity = point[3] ?? 0;
+    if (point[2] < minZ) minZ = point[2];
+    if (point[2] > maxZ) maxZ = point[2];
+    if (intensity < minI) minI = intensity;
+    if (intensity > maxI) maxI = intensity;
+  }
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    const intensity = point[3] ?? 0;
+    const heightT = normalizeScalar(point[2], minZ, maxZ);
+    const intensityT = normalizeScalar(intensity, minI, maxI);
+    const item: DisplayPoint = {
+      x: point[0],
+      y: point[1],
+      z: point[2],
+      intensity,
+      density: 1,
+      heightT,
+      intensityT,
+      densityT: 0.35,
+      edgeT: 0.12,
+      scalar: intensityT,
+      shade: clamp(0.82 + heightT * 0.16 + intensityT * 0.08, 0.74, 1.12),
+    };
+    if (point.length >= 7) {
+      item.rgb = [point[4] ?? 0, point[5] ?? 0, point[6] ?? 0];
+    }
+    result[index] = item;
+  }
+  return result;
+}
+
+function buildDisplayPointsDetailed(points: ScenePoint[]) {
   const voxelSize = resolveRenderVoxelSize(points.length, currentPointDensityScale());
   const buckets = new Map<string, PointBucket>();
 
@@ -690,7 +756,7 @@ function buildDisplayPoints(points: ScenePoint[]) {
   const lowDensity = percentile(densities, 0.04);
   const highDensity = percentile(densities, 0.98);
 
-  const neighborOffsets = result.length > 260000 ? faceNeighborOffsets : fullNeighborOffsets;
+  const neighborOffsets = result.length > interactiveNeighborThreshold ? faceNeighborOffsets : fullNeighborOffsets;
   let index = 0;
   buckets.forEach((bucket) => {
     const item = result[index];
@@ -707,7 +773,7 @@ function buildDisplayPoints(points: ScenePoint[]) {
     const occupancyT = neighborCount / neighborOffsets.length;
     const densitySupport = clamp(0.38 + item.densityT * 0.42, 0.38, 0.8);
     item.edgeT = clamp(Math.pow(1 - occupancyT, 1.08) * densitySupport, 0, 0.82);
-    item.scalar = item.heightT;
+    item.scalar = item.intensityT;
     item.shade = clamp(0.78 + item.heightT * 0.18 + item.intensityT * 0.08 + item.densityT * 0.06, 0.74, 1.12);
     index += 1;
   });
@@ -771,29 +837,28 @@ function resolveAutoPointDensityScale(sceneData: SceneResponse) {
 }
 
 function applyAutoPointAggregation(force = false) {
-  if (!autoPointAggregation.value || !props.sceneData || !camera || !controls) {
+  // Density auto-adjust used to rebuild the whole cloud on zoom — that freezes the UI.
+  // Keep camera-only interaction; rebuild only when the user explicitly toggles density tools.
+  if (!force || !autoPointAggregation.value || !props.sceneData || !camera || !controls) {
     return;
   }
 
   const nextDensity = resolveAutoPointDensityScale(props.sceneData);
-  if (!force && Math.abs(nextDensity - autoPointDensityScale.value) < 0.001) {
+  if (Math.abs(nextDensity - autoPointDensityScale.value) < 0.001) {
     return;
   }
 
   autoPointDensityScale.value = nextDensity;
-  scheduleAggregationRebuild();
+  selectionCache = null;
+  scheduleSceneRebuild(false);
 }
 
 function scheduleAggregationRebuild() {
+  // No-op: zoom/orbit must not rebuild geometry. Kept for call-site compatibility.
   if (autoAggregationTimer !== 0) {
-    return;
-  }
-
-  autoAggregationTimer = window.setTimeout(() => {
+    window.clearTimeout(autoAggregationTimer);
     autoAggregationTimer = 0;
-    selectionCache = null;
-    scheduleSceneRebuild(false);
-  }, 180);
+  }
 }
 
 function scheduleDeferredDenseRender() {
@@ -892,8 +957,8 @@ function initStage() {
   camera.up.set(0, 0, 1);
   camera.position.set(24, -32, 18);
 
-  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false, powerPreference: "high-performance" });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.08;
@@ -902,11 +967,23 @@ function initStage() {
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
-  controls.dampingFactor = 0.08;
+  controls.dampingFactor = 0.12;
   controls.minDistance = 8;
   controls.maxDistance = 220;
   controls.target.set(0, 0, 0);
-  controls.addEventListener("start", cancelAutoFocus);
+  controls.addEventListener("start", () => {
+    interactionActive = true;
+    cancelAutoFocus();
+    markNeedsRender();
+  });
+  controls.addEventListener("change", () => {
+    markNeedsRender();
+  });
+  controls.addEventListener("end", () => {
+    interactionActive = false;
+    // Camera interaction only — never rebuild the point cloud here.
+    markNeedsRender();
+  });
 
   stage.add(new THREE.AmbientLight("#9ad8ff", 0.42));
   stage.add(new THREE.HemisphereLight("#e9fbff", "#040c16", 0.78));
@@ -1135,7 +1212,16 @@ function renderSceneFrame() {
     return;
   }
 
-  if ((edlEnabled.value || surfaceFillEnabled.value) && edlAvailable.value && sceneRenderTarget && edlScene && edlCamera && edlMaterial) {
+  const allowEdl =
+    !interactionActive
+    && (edlEnabled.value || surfaceFillEnabled.value)
+    && edlAvailable.value
+    && sceneRenderTarget
+    && edlScene
+    && edlCamera
+    && edlMaterial;
+
+  if (allowEdl) {
     const fillDistanceRatio =
       props.sceneData && controls
         ? camera.position.distanceTo(controls.target) /
@@ -1175,26 +1261,30 @@ function animate() {
   }
 
   animationId = window.requestAnimationFrame(animate);
-  clock.getDelta();
 
   if (transition && controls) {
     const progress = clamp((performance.now() - transition.startedAt) / transition.durationMs, 0, 1);
     const eased = 1 - Math.pow(1 - progress, 3);
     camera.position.lerpVectors(transition.startPosition, transition.endPosition, eased);
     controls.target.lerpVectors(transition.startTarget, transition.endTarget, eased);
+    needsRender = true;
     if (progress >= 1) {
       transition = null;
+      needsRender = true;
     }
   }
 
-  controls?.update();
-  if (autoPointAggregation.value) {
-    const now = performance.now();
-    if (now - autoAggregationCheckAt > 140) {
-      autoAggregationCheckAt = now;
-      applyAutoPointAggregation(false);
-    }
+  const controlsUpdated = Boolean(controls?.update());
+  if (controlsUpdated) {
+    needsRender = true;
   }
+
+  if (!needsRender) {
+    return;
+  }
+
+  // Keep painting while camera damping / transitions are in flight; stop when settled.
+  needsRender = Boolean(transition) || controlsUpdated;
   renderSceneFrame();
 }
 
@@ -1241,6 +1331,10 @@ function clearDynamic() {
   selectableMeshes = [];
   zoneVisuals = [];
   playbackMarker = null;
+  pathProgressLine = null;
+  pathProgressIndex = -1;
+  pointCloudObject = null;
+  dimmableMaterials = [];
   cachedSceneMetrics = null;
   if (!stage || !dynamicGroup) {
     return;
@@ -1282,13 +1376,22 @@ function rebuildSceneGraph(reframeCamera: boolean) {
     );
     ground.rotation.x = Math.PI / 2;
     ground.position.set(center.x, center.y, min.z - 0.12);
+    ground.userData.dimmable = true;
     dynamicGroup.add(ground);
+    registerDimmableMaterial(ground.material as THREE.Material, 0.18);
 
     const grid = new THREE.GridHelper(span * 1.78, Math.max(18, Math.round(span * 1.15)), 0x16304c, 0x0a1728);
     grid.rotation.x = Math.PI / 2;
     grid.position.set(center.x, center.y, min.z - 0.04);
     applyGridStyle(grid, 0.18);
+    grid.userData.dimmable = true;
     dynamicGroup.add(grid);
+    const gridMaterial = grid.material;
+    if (Array.isArray(gridMaterial)) {
+      gridMaterial.forEach((entry) => registerDimmableMaterial(entry, 0.18));
+    } else {
+      registerDimmableMaterial(gridMaterial, 0.18);
+    }
 
     if (selection.renderPoints.length > 0) {
       dynamicGroup.add(buildPointCloud(selection.renderPoints, selection.bounds, span));
@@ -1297,13 +1400,16 @@ function rebuildSceneGraph(reframeCamera: boolean) {
       buildTrajectoryPoints(props.sceneData, min.z, span);
     }
     updatePlaybackMarker();
+    applyNonTrajectoryDim();
 
     if (reframeCamera) {
       startAutoFocus(true);
     }
+    markNeedsRender();
   } catch (error) {
     clearDynamic();
     renderError.value = error instanceof Error ? error.message : "Unknown scene render error";
+    markNeedsRender();
   }
 }
 
@@ -1371,70 +1477,115 @@ function buildPointCloud(points: DisplayPoint[], bounds: Bounds, span: number) {
   const pixelSize = clamp(basePixelSize * pointSizeScale.value, 0.88, 2.65);
   const maxPointSize = clamp(basePixelSize * 1.65, 2.4, 3.35);
 
-  const cloud = new THREE.Points(
-    geometry,
-    new THREE.ShaderMaterial({
-      uniforms: {
-        uPointSize: { value: pixelSize },
-        uMaxPointSize: { value: maxPointSize },
-      },
-      vertexColors: true,
-      transparent: false,
-      depthTest: true,
-      depthWrite: true,
-      vertexShader: `
-        attribute float feature;
-        attribute float shade;
+  const cloudMaterial = new THREE.ShaderMaterial({
+    uniforms: {
+      uPointSize: { value: pixelSize },
+      uMaxPointSize: { value: maxPointSize },
+      uOpacity: { value: 1 },
+    },
+    vertexColors: true,
+    transparent: false,
+    depthTest: true,
+    depthWrite: true,
+    vertexShader: `
+      attribute float feature;
+      attribute float shade;
 
-        uniform float uPointSize;
-        uniform float uMaxPointSize;
+      uniform float uPointSize;
+      uniform float uMaxPointSize;
 
-        varying vec3 vColor;
-        varying float vFeature;
-        varying float vShade;
+      varying vec3 vColor;
+      varying float vFeature;
+      varying float vShade;
 
-        void main() {
-          vColor = color;
-          vFeature = feature;
-          vShade = shade;
+      void main() {
+        vColor = color;
+        vFeature = feature;
+        vShade = shade;
 
-          vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
-          gl_Position = projectionMatrix * mvPosition;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
 
-          float depthT = clamp((-mvPosition.z - 8.0) / 90.0, 0.0, 1.0);
-          float depthTrim = mix(1.06, 0.82, depthT);
-          float featureBoost = mix(0.94, 1.08, feature);
-          gl_PointSize = clamp(uPointSize * depthTrim * featureBoost, 1.0, uMaxPointSize);
+        float depthT = clamp((-mvPosition.z - 8.0) / 90.0, 0.0, 1.0);
+        float depthTrim = mix(1.06, 0.82, depthT);
+        float featureBoost = mix(0.94, 1.08, feature);
+        gl_PointSize = clamp(uPointSize * depthTrim * featureBoost, 1.0, uMaxPointSize);
+      }
+    `,
+    fragmentShader: `
+      uniform float uOpacity;
+
+      varying vec3 vColor;
+      varying float vFeature;
+      varying float vShade;
+
+      void main() {
+        vec2 centered = gl_PointCoord - vec2(0.5);
+        float radiusSq = dot(centered, centered) * 4.0;
+        if (radiusSq > 0.96) {
+          discard;
         }
-      `,
-      fragmentShader: `
-        varying vec3 vColor;
-        varying float vFeature;
-        varying float vShade;
 
-        void main() {
-          vec2 centered = gl_PointCoord - vec2(0.5);
-          float radiusSq = dot(centered, centered) * 4.0;
-          if (radiusSq > 0.96) {
-            discard;
-          }
+        float rim = smoothstep(0.72, 0.96, radiusSq);
+        float contrast = 1.08;
+        vec3 color = clamp((vColor - vec3(0.5)) * contrast + vec3(0.5), 0.0, 1.0);
+        color *= clamp(vShade, 0.58, 1.28);
+        color *= 1.0 - rim * 0.1;
 
-          float rim = smoothstep(0.72, 0.96, radiusSq);
-          float contrast = 1.08;
-          vec3 color = clamp((vColor - vec3(0.5)) * contrast + vec3(0.5), 0.0, 1.0);
-          color *= clamp(vShade, 0.58, 1.28);
-          color *= 1.0 - rim * 0.1;
-
-          gl_FragColor = vec4(color, 1.0);
-          #include <tonemapping_fragment>
-          #include <colorspace_fragment>
-        }
-      `,
-    }),
-  );
+        gl_FragColor = vec4(color, uOpacity);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }
+    `,
+  });
+  const cloud = new THREE.Points(geometry, cloudMaterial);
   cloud.renderOrder = 1;
-  cloud.frustumCulled = false;
+  cloud.frustumCulled = true;
+  cloud.userData.dimmable = true;
+  pointCloudObject = cloud;
+  registerDimmableMaterial(cloudMaterial, 1);
   return cloud;
+}
+
+function registerDimmableMaterial(material: THREE.Material, baseOpacity = 1) {
+  dimmableMaterials.push({ material, baseOpacity });
+}
+
+function applyNonTrajectoryDim() {
+  const dimmed = dimNonTrajectory.value;
+  const targetOpacity = dimmed ? TRAJECTORY_DIM_OPACITY : 1;
+
+  dimmableMaterials.forEach(({ material, baseOpacity }) => {
+    const opacity = dimmed ? Math.min(baseOpacity, targetOpacity) : baseOpacity;
+    const shader = material as THREE.ShaderMaterial;
+    if (shader.uniforms?.uOpacity) {
+      shader.uniforms.uOpacity.value = opacity;
+      shader.transparent = opacity < 0.999;
+      shader.depthWrite = opacity >= 0.999;
+      return;
+    }
+    material.transparent = opacity < 0.999 || baseOpacity < 0.999;
+    material.opacity = opacity;
+    material.depthWrite = opacity >= 0.999;
+    material.needsUpdate = true;
+  });
+  markNeedsRender();
+}
+
+function applyPointSizeToCloud() {
+  if (!pointCloudObject) {
+    return;
+  }
+  const material = pointCloudObject.material as THREE.ShaderMaterial;
+  if (!material?.uniforms?.uPointSize) {
+    return;
+  }
+  const count = pointCloudObject.geometry.getAttribute("position")?.count ?? 1;
+  const densityScale = Math.log10(Math.max(1, count) / 12000);
+  const basePixelSize = clamp(1.72 - densityScale * 0.14, 1.18, 1.85);
+  material.uniforms.uPointSize.value = clamp(basePixelSize * pointSizeScale.value, 0.88, 2.65);
+  material.uniforms.uMaxPointSize.value = clamp(basePixelSize * 1.65, 2.4, 3.35);
+  markNeedsRender();
 }
 
 function nearestTrajectoryIndexByTimestamp(sceneData: SceneResponse, targetMs: number) {
@@ -1573,115 +1724,167 @@ function buildTrajectoryPoints(sceneData: SceneResponse, groundZ: number, span: 
     return;
   }
 
+  pathProgressLine = null;
+  pathProgressIndex = -1;
   const hazardMap = buildHazardTrajectoryMap(sceneData);
-  const indices = sampleTrajectoryPointIndices(sceneData, 1);
-  const pointRadius = clamp(span * 0.002, 0.055, 0.14);
-  const markerRadius = clamp(pointRadius * 1.32, 0.075, 0.18);
-  const arrowLength = clamp(span * 0.012, 0.36, 0.82);
-  const arrowRadius = clamp(pointRadius * 0.42, 0.024, 0.055);
-  const shaftLength = arrowLength * 0.58;
-  const headLength = arrowLength * 0.42;
-  const hazardArrowLength = arrowLength * 1.12;
-  const hazardShaftLength = hazardArrowLength * 0.58;
-  const hazardHeadLength = hazardArrowLength * 0.42;
-  const hazardArrowRadius = arrowRadius * 1.22;
-  const zLift = clamp(span * 0.006, 0.14, 0.32);
-  const pointGeometry = new THREE.SphereGeometry(pointRadius, 10, 10);
-  const markerGeometry = new THREE.SphereGeometry(markerRadius, 12, 12);
-  const shaftGeometry = new THREE.CylinderGeometry(arrowRadius * 0.46, arrowRadius * 0.46, shaftLength, 6);
-  const headGeometry = new THREE.ConeGeometry(arrowRadius * 1.45, headLength, 8);
-  const hazardShaftGeometry = new THREE.CylinderGeometry(
-    hazardArrowRadius * 0.5,
-    hazardArrowRadius * 0.5,
-    hazardShaftLength,
-    7,
+  const zLift = clamp(span * 0.008, 0.22, 0.55);
+  const hitSpacing = clamp(span * 0.05, 3.5, 9.0);
+  const hitRadius = clamp(span * 0.004, 0.14, 0.32);
+  const hazardRadius = clamp(span * 0.0045, 0.16, 0.36);
+
+  const elevated = sceneData.trajectory.map(
+    (point) => new THREE.Vector3(point[0], point[1], Math.max(point[2], groundZ) + zLift),
   );
-  const hazardHeadGeometry = new THREE.ConeGeometry(hazardArrowRadius * 1.58, hazardHeadLength, 9);
-  const pointMaterial = new THREE.MeshBasicMaterial({
-    color: "#a8c9d3",
+
+  if (elevated.length >= 2) {
+    const positions = new Float32Array(elevated.length * 3);
+    const colors = new Float32Array(elevated.length * 3);
+    for (let index = 0; index < elevated.length; index += 1) {
+      const point = elevated[index];
+      positions[index * 3] = point.x;
+      positions[index * 3 + 1] = point.y;
+      positions[index * 3 + 2] = point.z;
+      colors[index * 3] = 0.1;
+      colors[index * 3 + 1] = 0.86;
+      colors[index * 3 + 2] = 1.0;
+    }
+
+    const underlayGeometry = new THREE.BufferGeometry();
+    underlayGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    const underlay = new THREE.Line(
+      underlayGeometry,
+      new THREE.LineBasicMaterial({
+        color: "#031018",
+        transparent: true,
+        opacity: 0.9,
+        depthTest: false,
+        depthWrite: false,
+      }),
+    );
+    underlay.renderOrder = 5;
+    underlay.userData.trajectoryOverlay = true;
+    dynamicGroup.add(underlay);
+
+    const strokeGeometry = new THREE.BufferGeometry();
+    strokeGeometry.setAttribute("position", new THREE.BufferAttribute(positions.slice(), 3));
+    strokeGeometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    pathProgressLine = new THREE.Line(
+      strokeGeometry,
+      new THREE.LineBasicMaterial({
+        vertexColors: true,
+        transparent: false,
+        depthTest: false,
+        depthWrite: false,
+      }),
+    );
+    // Lift the colored stroke slightly so it sits above the underlay.
+    pathProgressLine.position.z = 0.04;
+    pathProgressLine.renderOrder = 6;
+    pathProgressLine.userData.trajectoryOverlay = true;
+    dynamicGroup.add(pathProgressLine);
+  }
+
+  // Invisible hit spheres keep click-to-seek; hazard markers stay visible.
+  const indices = sampleTrajectoryPointIndices(sceneData, hitSpacing);
+  const hitGeometry = new THREE.SphereGeometry(1, 8, 8);
+  const hitMaterial = new THREE.MeshBasicMaterial({
+    color: "#ffffff",
     transparent: true,
-    opacity: 0.42,
-    depthTest: true,
+    opacity: 0.001,
+    depthTest: false,
     depthWrite: false,
   });
-  const arrowMaterial = new THREE.MeshBasicMaterial({
-    color: "#d7eef1",
+  const hazardMaterialBase = {
+    color: "#ff3f2f",
     transparent: true,
-    opacity: 0.58,
+    opacity: 0.95,
     depthTest: true,
     depthWrite: false,
-  });
-  const hazardArrowMaterial = new THREE.MeshBasicMaterial({
-    color: "#ff6b4a",
-    transparent: true,
-    opacity: 0.88,
-    depthTest: true,
-    depthWrite: false,
-  });
+  } as const;
 
   indices.forEach((index) => {
     const point = sceneData.trajectory[index];
     const basePosition = new THREE.Vector3(point[0], point[1], Math.max(point[2], groundZ) + zLift);
-    const direction = resolveTrajectoryDisplayDirection(sceneData, index);
-    const pointMesh = new THREE.Mesh(pointGeometry, pointMaterial);
-    pointMesh.position.copy(basePosition);
-    pointMesh.renderOrder = 3;
-    pointMesh.userData = { kind: "trajectoryPoint" satisfies SelectableKind, trajectoryIndex: index };
-    dynamicGroup?.add(pointMesh);
-    selectableMeshes.push(pointMesh);
-
-    if (direction) {
-      const arrow = buildDirectionArrow(
-        basePosition,
-        direction,
-        shaftGeometry,
-        headGeometry,
-        arrowMaterial,
-        shaftLength,
-        headLength,
-      );
-      dynamicGroup?.add(arrow);
-    }
+    const hitMesh = new THREE.Mesh(hitGeometry, hitMaterial);
+    hitMesh.position.copy(basePosition);
+    hitMesh.scale.setScalar(hitRadius * 1.8);
+    hitMesh.renderOrder = 7;
+    hitMesh.userData = {
+      kind: "trajectoryPoint" satisfies SelectableKind,
+      trajectoryIndex: index,
+      trajectoryOverlay: true,
+    };
+    dynamicGroup?.add(hitMesh);
+    selectableMeshes.push(hitMesh);
 
     const zones = hazardMap.get(index) ?? [];
     zones.forEach((zone, offset) => {
-      const markerMaterial = new THREE.MeshBasicMaterial({
-        color: "#ff3f2f",
-        transparent: true,
-        opacity: 0.9,
-        depthTest: true,
-        depthWrite: false,
-      });
-      const markerMesh = new THREE.Mesh(markerGeometry, markerMaterial);
+      const markerMaterial = new THREE.MeshBasicMaterial(hazardMaterialBase);
+      const markerMesh = new THREE.Mesh(hitGeometry, markerMaterial);
       markerMesh.position.copy(basePosition);
-      markerMesh.position.z += markerRadius * (2.05 + offset * 1.35);
-      markerMesh.renderOrder = 6;
+      markerMesh.position.z += hazardRadius * (2.0 + offset * 1.3);
+      markerMesh.scale.setScalar(hazardRadius);
+      markerMesh.renderOrder = 8;
       markerMesh.userData = {
         kind: "hazardPathPoint" satisfies SelectableKind,
         trajectoryIndex: index,
         findingId: zone.finding_id,
+        trajectoryOverlay: true,
       };
       dynamicGroup?.add(markerMesh);
       selectableMeshes.push(markerMesh);
       zoneVisuals.push({ findingId: zone.finding_id, markerMaterial, markerMesh });
-
-      if (direction) {
-        const hazardArrowPosition = markerMesh.position.clone();
-        hazardArrowPosition.z += markerRadius * 0.52;
-        const hazardArrow = buildDirectionArrow(
-          hazardArrowPosition,
-          direction,
-          hazardShaftGeometry,
-          hazardHeadGeometry,
-          hazardArrowMaterial,
-          hazardShaftLength,
-          hazardHeadLength,
-        );
-        hazardArrow.renderOrder = 6;
-        dynamicGroup?.add(hazardArrow);
-      }
     });
   });
+}
+
+function ensurePlaybackMarker(_span: number) {
+  if (!dynamicGroup) {
+    return null;
+  }
+  if (playbackMarker) {
+    return playbackMarker;
+  }
+
+  const marker = new THREE.Mesh(
+    new THREE.SphereGeometry(1, 20, 20),
+    new THREE.MeshBasicMaterial({
+      color: "#ffe566",
+      transparent: false,
+      depthTest: false,
+      depthWrite: false,
+    }),
+  );
+  marker.renderOrder = 20;
+  marker.userData.trajectoryOverlay = true;
+  dynamicGroup.add(marker);
+  playbackMarker = marker;
+  return marker;
+}
+
+function updatePathProgressColors(currentIndex: number) {
+  if (!pathProgressLine) {
+    return;
+  }
+  if (currentIndex === pathProgressIndex) {
+    return;
+  }
+  pathProgressIndex = currentIndex;
+  const colorAttr = pathProgressLine.geometry.getAttribute("color") as THREE.BufferAttribute | undefined;
+  if (!colorAttr) {
+    return;
+  }
+  const count = colorAttr.count;
+  for (let index = 0; index < count; index += 1) {
+    if (index <= currentIndex) {
+      // Traveled: amber/gold
+      colorAttr.setXYZ(index, 1.0, 0.78, 0.18);
+    } else {
+      // Remaining: cyan
+      colorAttr.setXYZ(index, 0.12, 0.78, 1.0);
+    }
+  }
+  colorAttr.needsUpdate = true;
 }
 
 function applyZoneSelection() {
@@ -1691,12 +1894,14 @@ function applyZoneSelection() {
     visual.markerMaterial.opacity = selected ? 0.98 : 0.9;
     visual.markerMesh.scale.setScalar(selected ? 1.42 : 1);
   });
+  markNeedsRender();
 }
 
 function updatePlaybackMarker() {
   if (!dynamicGroup || !props.sceneData || !showPathPoints.value) {
     if (playbackMarker) {
       playbackMarker.visible = false;
+      markNeedsRender();
     }
     return;
   }
@@ -1705,7 +1910,9 @@ function updatePlaybackMarker() {
   if (timestamp === null || timestamp === undefined || !Number.isFinite(timestamp)) {
     if (playbackMarker) {
       playbackMarker.visible = false;
+      markNeedsRender();
     }
+    updatePathProgressColors(-1);
     return;
   }
 
@@ -1714,11 +1921,11 @@ function updatePlaybackMarker() {
   if (!point) {
     if (playbackMarker) {
       playbackMarker.visible = false;
+      markNeedsRender();
     }
     return;
   }
 
-  // Reuse cached metrics from rebuild; recompute only when unavailable.
   const metrics = cachedSceneMetrics ?? getSceneMetrics(props.sceneData);
   if (!cachedSceneMetrics) {
     cachedSceneMetrics = {
@@ -1729,27 +1936,18 @@ function updatePlaybackMarker() {
     };
   }
 
-  const zLift = clamp(metrics.span * 0.006, 0.14, 0.32);
-  const radius = clamp(metrics.span * 0.0035, 0.09, 0.22);
-
-  if (!playbackMarker) {
-    playbackMarker = new THREE.Mesh(
-      new THREE.SphereGeometry(1, 14, 14),
-      new THREE.MeshBasicMaterial({
-        color: "#ffd166",
-        transparent: true,
-        opacity: 0.95,
-        depthTest: true,
-        depthWrite: false,
-      }),
-    );
-    playbackMarker.renderOrder = 8;
-    dynamicGroup.add(playbackMarker);
+  const zLift = clamp(metrics.span * 0.008, 0.22, 0.55);
+  const radius = clamp(metrics.span * 0.01, 0.35, 1.1);
+  const marker = ensurePlaybackMarker(metrics.span);
+  if (!marker) {
+    return;
   }
 
-  playbackMarker.visible = true;
-  playbackMarker.scale.setScalar(radius);
-  playbackMarker.position.set(point[0], point[1], Math.max(point[2], metrics.min.z) + zLift + radius * 1.2);
+  marker.visible = true;
+  marker.scale.setScalar(radius);
+  marker.position.set(point[0], point[1], Math.max(point[2], metrics.min.z) + zLift);
+  updatePathProgressColors(index);
+  markNeedsRender();
 }
 
 function startAutoFocus(immediate = false) {
@@ -1876,9 +2074,9 @@ watch(
       floorCutHeightM.value = Number((sliderConfig.value.min || 0).toFixed(2));
     }
     if (sceneData !== previous) {
-      autoPointAggregation.value = true;
-      pointDensityScale.value = 2.75;
-      autoPointDensityScale.value = 2.75;
+      autoPointAggregation.value = false;
+      pointDensityScale.value = 2.0;
+      autoPointDensityScale.value = 2.0;
     }
     suppressRebuildWatchers = false;
     if (sceneData !== previous) {
@@ -1912,13 +2110,15 @@ watch(
 
 watch(() => pointSizeScale.value, () => {
   if (!suppressRebuildWatchers) {
-    scheduleSceneRebuild(false);
+    // Point size is a shader uniform — do not rebuild geometry.
+    applyPointSizeToCloud();
   }
 });
 watch(() => pointDensityScale.value, () => {
   if (suppressRebuildWatchers) {
     return;
   }
+  // Explicit density change is the rare case that rebuilds the cloud once.
   clearSelectionCache(true);
   if (autoPointAggregation.value && props.sceneData) {
     autoPointDensityScale.value = resolveAutoPointDensityScale(props.sceneData);
@@ -1930,15 +2130,22 @@ watch(() => autoPointAggregation.value, () => {
     return;
   }
   clearSelectionCache(true);
-  if (autoPointAggregation.value) {
-    applyAutoPointAggregation(true);
-    return;
+  scheduleSceneRebuild(false);
+});
+watch(() => structureClarity.value, () => {
+  // EDL reads this each frame — no geometry rebuild.
+  markNeedsRender();
+});
+watch(() => colorMode.value, () => scheduleSceneRebuild(false));
+watch(() => showPathPoints.value, (visible) => {
+  if (!visible) {
+    dimNonTrajectory.value = false;
   }
   scheduleSceneRebuild(false);
 });
-watch(() => structureClarity.value, () => scheduleSceneRebuild(false));
-watch(() => colorMode.value, () => scheduleSceneRebuild(false));
-watch(() => showPathPoints.value, () => scheduleSceneRebuild(false));
+watch(() => dimNonTrajectory.value, () => applyNonTrajectoryDim());
+watch(() => edlEnabled.value, () => markNeedsRender());
+watch(() => surfaceFillEnabled.value, () => markNeedsRender());
 watch(() => hasRgbColor.value, (available) => {
   if (!available && colorMode.value === "rgb") {
     colorMode.value = "structure";
@@ -2013,6 +2220,14 @@ onBeforeUnmount(() => {
         <div class="scene-topbar-actions">
           <button class="toolbar-button scene-control-toggle" :class="{ active: showPathPoints }" @click="showPathPoints = !showPathPoints">
             {{ showPathPoints ? "隐藏路径" : "显示路径" }}
+          </button>
+          <button
+            class="toolbar-button scene-control-toggle"
+            :class="{ active: dimNonTrajectory }"
+            :disabled="!showPathPoints"
+            @click="dimNonTrajectory = !dimNonTrajectory"
+          >
+            {{ dimNonTrajectory ? "恢复点云" : "突出轨迹" }}
           </button>
           <button class="toolbar-button scene-control-toggle" :class="{ active: !fullHeightMode }" @click="toggleFullHeightMode">
             {{ fullHeightMode ? "切顶切底" : "全量高度" }}

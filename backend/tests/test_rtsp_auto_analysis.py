@@ -116,7 +116,20 @@ class RtspAutoAnalysisTest(unittest.TestCase):
                             with patch("app.services.rtsp_watchdog.release_stream_recording_lock"):
                                 with patch("app.services.rtsp_watchdog.spawn_record_rtsp_until_disconnect") as spawn_mock:
                                     spawn_mock.return_value.poll.return_value = None
-                                    rtsp_watchdog._poll_vehicle("local-demo", "rtsp://127.0.0.1:18554/live")
+                                    with patch(
+                                        "app.services.rtsp_timeline.resolve_recording_video_start_ts",
+                                        return_value=__import__(
+                                            "app.services.rtsp_timeline",
+                                            fromlist=["RtspTimelineSample"],
+                                        ).RtspTimelineSample(
+                                            timestamp_ms=1_774_328_748_518,
+                                            source="rtsp_time_barcode",
+                                        ),
+                                    ):
+                                        with patch("app.services.rtsp_timeline.write_recording_timeline_meta"):
+                                            rtsp_watchdog._poll_vehicle(
+                                                "local-demo", "rtsp://127.0.0.1:18554/live"
+                                            )
         yolo_monitor_mock.assert_called_once_with("local-demo", "rtsp://127.0.0.1:18554/live")
         schedule_mock.assert_called_once_with("rtsp://127.0.0.1:18554/live")
 

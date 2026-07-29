@@ -44,6 +44,7 @@ class GenerateRtspStreamTests(unittest.TestCase):
         joined = " ".join(command)
         self.assertIn("split=2", joined)
         self.assertIn("TIME SYNC", joined)
+        self.assertIn("format=rgb24", joined)
         self.assertIn("mod(PTS*TB", joined)
         self.assertIn("1774328748.518000", joined)
         self.assertIn("%{pts\\:gmtime}", joined)

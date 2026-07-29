@@ -74,6 +74,11 @@ export function getRtspPlaybackState(rtspUrl: string, projectId?: number | null)
   return request<RtspPlaybackState>(`/api/rtsp-playback-state?${params.toString()}`);
 }
 
+/** Load a vehicle onboard map (transport-compacted scene.json) for preview. */
+export function getVehicleScene(vehicleId: string) {
+  return request<SceneResponse>(`/api/rtsp-vehicles/${encodeURIComponent(vehicleId)}/scene`);
+}
+
 export function getProjects() {
   return request<ProjectSummary[]>("/api/projects");
 }

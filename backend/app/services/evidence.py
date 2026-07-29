@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ..models import Finding, Project
 from ..settings import CLIP_COMPRESS_TIMEOUT_SECONDS, FFMPEG_BIN
-from .storage import read_json, remove_paths
+from .storage import read_json, remove_paths, resolve_project_path
 
 logger = logging.getLogger(__name__)
 _EVIDENCE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="evidence")
@@ -25,7 +25,12 @@ def cache_evidence_frames(
     When ``replace_all`` is False (monitor path), existing frames are kept and
     only missing timestamps are extracted.
     """
-    if not project.inspection_video_path:
+    video_path = resolve_project_path(
+        project.artifacts_dir or "",
+        project.inspection_video_path,
+        "artifacts/inspection.mp4",
+    )
+    if not video_path.exists():
         raise FileNotFoundError("Project video is missing")
 
     evidence_dir = _evidence_dir(project)
@@ -39,7 +44,6 @@ def cache_evidence_frames(
         return {"frame_count": 0, "removed_bytes": removed_bytes}
 
     video_start_ts = _video_start_ts(project)
-    video_path = Path(project.inspection_video_path)
 
     if replace_all:
         pending = timestamps

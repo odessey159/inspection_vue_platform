@@ -4,7 +4,7 @@
 vehicles:
   - id: local-demo
     name: 本地测试巡检车
-    rtsp_url: rtsp://127.0.0.1:18554/live
+    rtsp_url: rtsp://10.0.0.52:8554/robot
   - id: vehicle-02
     name: 巡检车02
     rtsp_url: rtsp://127.0.0.1:18554/live

@@ -97,13 +97,13 @@ const renderError = ref("");
 const cutHeightM = ref(0);
 const floorCutHeightM = ref(0);
 const pointSizeScale = ref(0.82);
-const pointDensityScale = ref(2.0);
+const pointDensityScale = ref(2.75);
 const autoPointAggregation = ref(false);
-const autoPointDensityScale = ref(2.0);
-const structureClarity = ref(1.0);
+const autoPointDensityScale = ref(2.75);
+const structureClarity = ref(1.15);
 const colorMode = ref<ColorMode>("inverseIntensityRainbow");
-const edlEnabled = ref(false);
-const surfaceFillEnabled = ref(false);
+const edlEnabled = ref(true);
+const surfaceFillEnabled = ref(true);
 const lastSelectionStats = ref<PointSelectionStats | null>(null);
 
 let renderer: THREE.WebGLRenderer | null = null;
@@ -138,6 +138,7 @@ let suppressRebuildWatchers = false;
 let denseRenderReady = false;
 let needsRender = true;
 let interactionActive = false;
+let lastBuiltSceneData: SceneResponse | null = null;
 let selectionCache:
   | {
       sceneData: SceneResponse;
@@ -152,13 +153,9 @@ let selectionCache:
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
-const percentileSampleLimit = 12000;
-const fastInitialPointThreshold = 50000;
-/** Cap source points fed into aggregation — keep orbit/zoom interactive. */
-const maxRenderSourcePoints = 48000;
-const fastInitialPointTarget = 32000;
-const interactiveNeighborThreshold = 28000;
-const fastDisplayPointThreshold = 20000;
+const percentileSampleLimit = 22000;
+const fastInitialPointThreshold = 180000;
+const fastInitialPointTarget = 140000;
 const faceNeighborOffsets: Array<[number, number, number]> = [
   [1, 0, 0],
   [-1, 0, 0],
@@ -325,11 +322,11 @@ function sampleHasRgb(points: ScenePoint[]) {
   return false;
 }
 
-function limitInitialRenderPoints(points: ScenePoint[], target = fastInitialPointTarget) {
-  if (points.length <= target) {
+function limitInitialRenderPoints(points: ScenePoint[]) {
+  if (points.length <= fastInitialPointTarget) {
     return points;
   }
-  const stride = Math.max(1, Math.ceil(points.length / target));
+  const stride = Math.max(1, Math.ceil(points.length / fastInitialPointTarget));
   const limited: ScenePoint[] = [];
   for (let index = 0; index < points.length; index += stride) {
     limited.push(points[index]);
@@ -509,18 +506,17 @@ function getPointSelection(sceneData: SceneResponse): PointSelection {
     return selectionCache.selection;
   }
 
-  const sourcePoints = limitInitialRenderPoints(getSourcePoints(sceneData), maxRenderSourcePoints);
+  const sourcePoints = getSourcePoints(sceneData);
   const backendPoints = sceneData.structure_points.length > 0 ? sceneData.structure_points : sceneData.render_points;
   if (isDefaultCut(sceneData) && backendPoints.length > 0) {
     const denseSourcePoints = getDenseSourcePoints(sceneData);
-    const cappedDense = limitInitialRenderPoints(denseSourcePoints, maxRenderSourcePoints);
     const shouldUseFastBackend =
       !denseRenderReady && fullHeightMode.value && denseSourcePoints.length > fastInitialPointThreshold;
     const aggregationSource = shouldUseFastBackend
-      ? limitInitialRenderPoints(backendPoints.length > 0 ? backendPoints : cappedDense, fastInitialPointTarget)
-      : cappedDense.length > 0
-        ? cappedDense
-        : limitInitialRenderPoints(backendPoints, maxRenderSourcePoints);
+      ? limitInitialRenderPoints(backendPoints.length > 0 ? backendPoints : denseSourcePoints)
+      : denseSourcePoints.length > 0
+        ? denseSourcePoints
+        : backendPoints;
     const renderPoints = buildDisplayPoints(aggregationSource);
     const selection = {
       sourcePoints: aggregationSource.length > 0 ? aggregationSource : sourcePoints,
@@ -545,8 +541,7 @@ function getPointSelection(sceneData: SceneResponse): PointSelection {
       selection,
     };
     if (shouldUseFastBackend) {
-      // Keep the capped fast cloud — upgrading to full density freezes interaction.
-      denseRenderReady = true;
+      scheduleDeferredDenseRender();
     }
     return selection;
   }
@@ -626,55 +621,6 @@ function computeBounds(points: ScenePoint[], trajectory: [number, number, number
 }
 
 function buildDisplayPoints(points: ScenePoint[]) {
-  const capped = limitInitialRenderPoints(points, maxRenderSourcePoints);
-  // Fast path: skip voxel+neighbor graph for large clouds (main source of zoom hitch).
-  if (capped.length >= fastDisplayPointThreshold || interactionActive) {
-    return buildDisplayPointsFast(capped);
-  }
-  return buildDisplayPointsDetailed(capped);
-}
-
-function buildDisplayPointsFast(points: ScenePoint[]): DisplayPoint[] {
-  const result: DisplayPoint[] = new Array(points.length);
-  let minZ = Number.POSITIVE_INFINITY;
-  let maxZ = Number.NEGATIVE_INFINITY;
-  let minI = Number.POSITIVE_INFINITY;
-  let maxI = Number.NEGATIVE_INFINITY;
-  for (let index = 0; index < points.length; index += 1) {
-    const point = points[index];
-    const intensity = point[3] ?? 0;
-    if (point[2] < minZ) minZ = point[2];
-    if (point[2] > maxZ) maxZ = point[2];
-    if (intensity < minI) minI = intensity;
-    if (intensity > maxI) maxI = intensity;
-  }
-  for (let index = 0; index < points.length; index += 1) {
-    const point = points[index];
-    const intensity = point[3] ?? 0;
-    const heightT = normalizeScalar(point[2], minZ, maxZ);
-    const intensityT = normalizeScalar(intensity, minI, maxI);
-    const item: DisplayPoint = {
-      x: point[0],
-      y: point[1],
-      z: point[2],
-      intensity,
-      density: 1,
-      heightT,
-      intensityT,
-      densityT: 0.35,
-      edgeT: 0.12,
-      scalar: intensityT,
-      shade: clamp(0.82 + heightT * 0.16 + intensityT * 0.08, 0.74, 1.12),
-    };
-    if (point.length >= 7) {
-      item.rgb = [point[4] ?? 0, point[5] ?? 0, point[6] ?? 0];
-    }
-    result[index] = item;
-  }
-  return result;
-}
-
-function buildDisplayPointsDetailed(points: ScenePoint[]) {
   const voxelSize = resolveRenderVoxelSize(points.length, currentPointDensityScale());
   const buckets = new Map<string, PointBucket>();
 
@@ -756,7 +702,7 @@ function buildDisplayPointsDetailed(points: ScenePoint[]) {
   const lowDensity = percentile(densities, 0.04);
   const highDensity = percentile(densities, 0.98);
 
-  const neighborOffsets = result.length > interactiveNeighborThreshold ? faceNeighborOffsets : fullNeighborOffsets;
+  const neighborOffsets = result.length > 260000 ? faceNeighborOffsets : fullNeighborOffsets;
   let index = 0;
   buckets.forEach((bucket) => {
     const item = result[index];
@@ -957,8 +903,8 @@ function initStage() {
   camera.up.set(0, 0, 1);
   camera.position.set(24, -32, 18);
 
-  renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false, powerPreference: "high-performance" });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.08;
@@ -967,7 +913,7 @@ function initStage() {
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
-  controls.dampingFactor = 0.12;
+  controls.dampingFactor = 0.08;
   controls.minDistance = 8;
   controls.maxDistance = 220;
   controls.target.set(0, 0, 0);
@@ -1212,14 +1158,17 @@ function renderSceneFrame() {
     return;
   }
 
+  const activeRenderTarget = sceneRenderTarget;
+  const activeEdlScene = edlScene;
+  const activeEdlCamera = edlCamera;
+  const activeEdlMaterial = edlMaterial;
   const allowEdl =
-    !interactionActive
-    && (edlEnabled.value || surfaceFillEnabled.value)
+    (edlEnabled.value || surfaceFillEnabled.value)
     && edlAvailable.value
-    && sceneRenderTarget
-    && edlScene
-    && edlCamera
-    && edlMaterial;
+    && activeRenderTarget
+    && activeEdlScene
+    && activeEdlCamera
+    && activeEdlMaterial;
 
   if (allowEdl) {
     const fillDistanceRatio =
@@ -1233,21 +1182,21 @@ function renderSceneFrame() {
           )
         : 1;
     const farFillT = clamp((fillDistanceRatio - 0.34) / 0.82, 0, 1);
-    edlMaterial.uniforms.uNear.value = camera.near;
-    edlMaterial.uniforms.uFar.value = camera.far;
-    edlMaterial.uniforms.uRadius.value = clamp(1.0 + structureClarity.value * 0.22 + farFillT * 0.28, 1.05, 1.75);
-    edlMaterial.uniforms.uStrength.value = edlEnabled.value
+    activeEdlMaterial.uniforms.uNear.value = camera.near;
+    activeEdlMaterial.uniforms.uFar.value = camera.far;
+    activeEdlMaterial.uniforms.uRadius.value = clamp(1.0 + structureClarity.value * 0.22 + farFillT * 0.28, 1.05, 1.75);
+    activeEdlMaterial.uniforms.uStrength.value = edlEnabled.value
       ? clamp(0.72 + structureClarity.value * 0.42, 0.86, 1.48)
       : 0;
-    edlMaterial.uniforms.uFillRadius.value = surfaceFillEnabled.value ? clamp(1.25 + farFillT * 1.35, 1.25, 2.6) : 0;
-    edlMaterial.uniforms.uFillStrength.value = surfaceFillEnabled.value ? clamp(0.48 + farFillT * 0.34, 0.48, 0.86) : 0;
-    edlMaterial.uniforms.uSurfaceFillEnabled.value = surfaceFillEnabled.value ? 1 : 0;
-    renderer.setRenderTarget(sceneRenderTarget);
+    activeEdlMaterial.uniforms.uFillRadius.value = surfaceFillEnabled.value ? clamp(1.25 + farFillT * 1.35, 1.25, 2.6) : 0;
+    activeEdlMaterial.uniforms.uFillStrength.value = surfaceFillEnabled.value ? clamp(0.48 + farFillT * 0.34, 0.48, 0.86) : 0;
+    activeEdlMaterial.uniforms.uSurfaceFillEnabled.value = surfaceFillEnabled.value ? 1 : 0;
+    renderer.setRenderTarget(activeRenderTarget);
     renderer.clear();
     renderer.render(stage, camera);
     renderer.setRenderTarget(null);
     renderer.clear();
-    renderer.render(edlScene, edlCamera);
+    renderer.render(activeEdlScene, activeEdlCamera);
     return;
   }
 
@@ -1405,6 +1354,7 @@ function rebuildSceneGraph(reframeCamera: boolean) {
     if (reframeCamera) {
       startAutoFocus(true);
     }
+    lastBuiltSceneData = props.sceneData;
     markNeedsRender();
   } catch (error) {
     clearDynamic();
@@ -1717,6 +1667,44 @@ function buildDirectionArrow(
   head.renderOrder = 4;
   group.add(shaft, head);
   return group;
+}
+
+function trajectoryFingerprint(sceneData: SceneResponse | null) {
+  if (!sceneData) {
+    return "0";
+  }
+  const stamps = sceneData.trajectory_timestamps;
+  return `${sceneData.trajectory.length}:${stamps[stamps.length - 1] ?? 0}`;
+}
+
+function removeTrajectoryOverlay() {
+  if (!dynamicGroup) {
+    return;
+  }
+  const overlay = dynamicGroup.children.filter((child) => Boolean(child.userData?.trajectoryOverlay));
+  overlay.forEach((child) => {
+    dynamicGroup?.remove(child);
+    disposeObject(child);
+  });
+  selectableMeshes = selectableMeshes.filter((mesh) => !mesh.userData?.trajectoryOverlay);
+  zoneVisuals = [];
+  pathProgressLine = null;
+  pathProgressIndex = -1;
+  playbackMarker = null;
+}
+
+function refreshTrajectoryOverlay() {
+  if (!dynamicGroup || !props.sceneData) {
+    return;
+  }
+  removeTrajectoryOverlay();
+  if (showPathPoints.value && props.sceneData.trajectory.length > 0) {
+    const metrics = cachedSceneMetrics ?? getSceneMetrics(props.sceneData);
+    buildTrajectoryPoints(props.sceneData, metrics.min.z, metrics.span);
+  }
+  updatePlaybackMarker();
+  applyNonTrajectoryDim();
+  markNeedsRender();
 }
 
 function buildTrajectoryPoints(sceneData: SceneResponse, groundZ: number, span: number) {
@@ -2075,8 +2063,8 @@ watch(
     }
     if (sceneData !== previous) {
       autoPointAggregation.value = false;
-      pointDensityScale.value = 2.0;
-      autoPointDensityScale.value = 2.0;
+      pointDensityScale.value = 2.75;
+      autoPointDensityScale.value = 2.75;
     }
     suppressRebuildWatchers = false;
     if (sceneData !== previous) {
@@ -2130,6 +2118,10 @@ watch(() => autoPointAggregation.value, () => {
     return;
   }
   clearSelectionCache(true);
+  if (autoPointAggregation.value) {
+    applyAutoPointAggregation(true);
+    return;
+  }
   scheduleSceneRebuild(false);
 });
 watch(() => structureClarity.value, () => {
@@ -2168,6 +2160,15 @@ watch(() => props.selectedFindingId, () => {
 watch(() => props.activeTimestampMs, () => {
   updatePlaybackMarker();
 });
+watch(
+  () => trajectoryFingerprint(props.sceneData),
+  () => {
+    if (!props.sceneData || props.sceneData !== lastBuiltSceneData) {
+      return;
+    }
+    refreshTrajectoryOverlay();
+  },
+);
 
 onBeforeUnmount(() => {
   window.cancelAnimationFrame(animationId);

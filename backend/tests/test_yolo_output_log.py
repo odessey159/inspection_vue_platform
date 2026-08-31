@@ -25,6 +25,7 @@ class YoloOutputLogTest(unittest.TestCase):
                             "confidence": 0.91,
                             "time_sec": 1.5,
                             "bbox": [10.0, 20.0, 100.0, 200.0],
+                            "camera_view": "rear",
                         }
                     ],
                     notes=["segment_index=1", "detections=1"],
@@ -35,6 +36,7 @@ class YoloOutputLogTest(unittest.TestCase):
             content = log_path.read_text(encoding="utf-8")
             self.assertIn("=== YOLO Detection Output ===", content)
             self.assertIn("class=powerbox", content)
+            self.assertIn("view=rear", content)
             self.assertIn("payload_json:", content)
 
     def test_build_detection_log_text_includes_metadata(self) -> None:

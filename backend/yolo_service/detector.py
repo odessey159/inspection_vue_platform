@@ -11,7 +11,14 @@ from threading import Lock
 
 import cv2
 
+from .frame_layout import (
+    LAYOUT_QUAD,
+    env_frame_layout,
+    resolve_frame_layout,
+    split_quad_tiles,
+)
 from .settings import YOLO_CONFIDENCE, YOLO_EXPECTED_CLASSES, YOLO_IMGSZ, YOLO_WEIGHTS_PATH
+
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +29,7 @@ class VideoDetection:
     confidence: float
     time_sec: float
     bbox: list[float]
+    camera_view: str | None = None
 
 
 class YoloVideoDetector:
@@ -61,9 +69,17 @@ class YoloVideoDetector:
         names = getattr(self._model, "names", {}) or {}
         return {int(key): str(value) for key, value in names.items()}
 
-    def detect_video(self, video_path: Path) -> tuple[list[VideoDetection], list[str]]:
-        """Run streaming predict over an on-disk video file."""
+    def detect_video(
+        self,
+        video_path: Path,
+        *,
+        frame_layout: str | None = None,
+    ) -> tuple[list[VideoDetection], list[str]]:
+        """Run detection over an on-disk video file."""
+        layout = resolve_frame_layout(frame_layout, default=env_frame_layout())
         with self._lock:
+            if layout == LAYOUT_QUAD:
+                return self._detect_video_frames_unlocked(video_path, layout=layout)
             return self._detect_video_unlocked(video_path)
 
     def detect_rtsp(
@@ -72,13 +88,16 @@ class YoloVideoDetector:
         *,
         duration_sec: float,
         rtsp_transport: str = "tcp",
+        frame_layout: str | None = None,
     ) -> tuple[list[VideoDetection], list[str]]:
         """Capture RTSP frames for up to duration_sec and predict each frame."""
+        layout = resolve_frame_layout(frame_layout, default=env_frame_layout())
         with self._lock:
             return self._detect_rtsp_unlocked(
                 rtsp_url,
                 duration_sec=duration_sec,
                 rtsp_transport=rtsp_transport,
+                layout=layout,
             )
 
     def _detect_video_unlocked(self, video_path: Path) -> tuple[list[VideoDetection], list[str]]:
@@ -96,6 +115,7 @@ class YoloVideoDetector:
             f"weights={YOLO_WEIGHTS_PATH.name}",
             f"imgsz={YOLO_IMGSZ}",
             f"video_fps={fps:.3f}",
+            "frame_layout=full",
         ]
 
         results = self._model.predict(
@@ -116,12 +136,50 @@ class YoloVideoDetector:
         notes.append(f"detections={len(detections)}")
         return detections, notes
 
+    def _detect_video_frames_unlocked(
+        self,
+        video_path: Path,
+        *,
+        layout: str,
+    ) -> tuple[list[VideoDetection], list[str]]:
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            raise RuntimeError(f"Unable to open uploaded video: {video_path.name}")
+
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        if fps <= 0:
+            fps = 25.0
+
+        detections: list[VideoDetection] = []
+        notes = [
+            f"weights={YOLO_WEIGHTS_PATH.name}",
+            f"imgsz={YOLO_IMGSZ}",
+            f"video_fps={fps:.3f}",
+            f"frame_layout={layout}",
+        ]
+        frame_count = 0
+        try:
+            while True:
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    break
+                time_sec = frame_count / fps
+                self._predict_frame(frame, detections, time_sec=time_sec, layout=layout)
+                frame_count += 1
+        finally:
+            capture.release()
+
+        notes.append(f"frames={frame_count}")
+        notes.append(f"detections={len(detections)}")
+        return detections, notes
+
     def _detect_rtsp_unlocked(
         self,
         rtsp_url: str,
         *,
         duration_sec: float,
         rtsp_transport: str,
+        layout: str = LAYOUT_QUAD,
     ) -> tuple[list[VideoDetection], list[str]]:
         normalized_url = rtsp_url.strip()
         if not normalized_url.lower().startswith("rtsp://"):
@@ -149,6 +207,7 @@ class YoloVideoDetector:
             f"rtsp_transport={transport}",
             f"duration_sec={duration_sec:.3f}",
             f"stream_fps={fps:.3f}",
+            f"frame_layout={layout}",
         ]
 
         started_at = time.monotonic()
@@ -163,14 +222,7 @@ class YoloVideoDetector:
                 if not ok or frame is None:
                     break
 
-                results = self._model.predict(
-                    source=frame,
-                    imgsz=YOLO_IMGSZ,
-                    conf=YOLO_CONFIDENCE,
-                    verbose=False,
-                )
-                if results:
-                    self._collect_detections(results[0], detections, time_sec=elapsed_sec)
+                self._predict_frame(frame, detections, time_sec=elapsed_sec, layout=layout)
                 frame_count += 1
         finally:
             capture.release()
@@ -182,29 +234,87 @@ class YoloVideoDetector:
     def _configure_rtsp_transport(self, transport: str) -> None:
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}"
 
+    def _predict_frame(
+        self,
+        frame: object,
+        detections: list[VideoDetection],
+        *,
+        time_sec: float,
+        layout: str,
+    ) -> None:
+        if layout == LAYOUT_QUAD:
+            tiles = split_quad_tiles(frame)
+            if tiles:
+                for view, crop, origin_x, origin_y in tiles:
+                    self._predict_one(
+                        crop,
+                        detections,
+                        time_sec=time_sec,
+                        camera_view=view,
+                        origin=(origin_x, origin_y),
+                    )
+                return
+        self._predict_one(frame, detections, time_sec=time_sec)
+
+    def _predict_one(
+        self,
+        source: object,
+        detections: list[VideoDetection],
+        *,
+        time_sec: float,
+        camera_view: str | None = None,
+        origin: tuple[int, int] = (0, 0),
+    ) -> None:
+        results = self._model.predict(
+            source=source,
+            imgsz=YOLO_IMGSZ,
+            conf=YOLO_CONFIDENCE,
+            verbose=False,
+        )
+        if results:
+            self._collect_detections(
+                results[0],
+                detections,
+                time_sec=time_sec,
+                camera_view=camera_view,
+                origin=origin,
+            )
+
     def _collect_detections(
         self,
         result: object,
         detections: list[VideoDetection],
         *,
         time_sec: float,
+        camera_view: str | None = None,
+        origin: tuple[int, int] = (0, 0),
     ) -> None:
         boxes = getattr(result, "boxes", None)
         if boxes is None:
             return
 
         names = getattr(result, "names", None) or self._model.names or {}
+        origin_x, origin_y = origin
         for box in boxes:
             cls_id = int(box.cls[0])
             class_name = str(names.get(cls_id, cls_id)).strip()
             confidence = float(box.conf[0])
             if confidence < YOLO_CONFIDENCE or not class_name:
                 continue
+            xyxy = [float(value) for value in box.xyxy[0].tolist()]
+            if len(xyxy) >= 4 and (origin_x or origin_y):
+                xyxy = [
+                    xyxy[0] + origin_x,
+                    xyxy[1] + origin_y,
+                    xyxy[2] + origin_x,
+                    xyxy[3] + origin_y,
+                ]
             detections.append(
                 VideoDetection(
                     class_name=class_name,
                     confidence=max(0.0, min(1.0, confidence)),
                     time_sec=time_sec,
-                    bbox=[float(value) for value in box.xyxy[0].tolist()],
+                    bbox=xyxy,
+                    camera_view=camera_view,
                 )
             )

@@ -20,6 +20,7 @@ from ..settings import (
     YOLO_CONFIDENCE_THRESHOLD,
     YOLO_DETECT_PATH,
     YOLO_FAIL_OPEN,
+    YOLO_FRAME_LAYOUT,
     YOLO_MAX_RETRIES,
     YOLO_REQUEST_TIMEOUT_SECONDS,
     YOLO_RTSP_DEFAULT_DURATION_SEC,
@@ -27,6 +28,7 @@ from ..settings import (
     YOLO_RTSP_MAX_DURATION_SEC,
     YOLO_RTSP_SEGMENT_SECONDS,
     YOLO_RTSP_TRANSPORT,
+    YOLO_SAME_TIME_DEDUPE_WINDOW_MS,
     resolve_vision_model,
 )
 from .rule_retriever import (
@@ -66,6 +68,7 @@ class YoloDetectionPayload(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     time_sec: float | None = None
     bbox: list[float] = Field(default_factory=list)
+    camera_view: str | None = None
 
 
 class YoloClipResponsePayload(BaseModel):
@@ -298,7 +301,7 @@ def run_provider_yolo_rtsp_live_analysis(
         except Exception as exc:
             diagnostics.append(f"clip-{clip.index:02d} failed: {exc}")
 
-    deduped = _dedupe_seeds(seeds)
+    deduped = _dedupe_seeds(seeds, same_time_window_ms=YOLO_SAME_TIME_DEDUPE_WINDOW_MS)
     status = "provider_analyzed" if successful_clips > 0 else "provider_failed"
     if successful_clips > 0 and not deduped:
         notes.append("RTSP live YOLO + Provider completed successfully and returned no hazards.")
@@ -425,7 +428,7 @@ def run_provider_yolo_analysis(
         except Exception as exc:
             diagnostics.append(f"clip-{clip.index:02d} failed: {exc}")
 
-    deduped = _dedupe_seeds(seeds)
+    deduped = _dedupe_seeds(seeds, same_time_window_ms=YOLO_SAME_TIME_DEDUPE_WINDOW_MS)
     status = "provider_analyzed" if successful_clips > 0 else "provider_failed"
     if successful_clips > 0 and not deduped:
         notes.append("YOLO + Provider completed successfully and returned no hazards.")
@@ -577,6 +580,15 @@ def _build_yolo_prompt_section(
         "",
         "Detected objects:",
     ]
+    layout = (YOLO_FRAME_LAYOUT or "").strip().lower()
+    is_quad = layout not in {"full", "whole", "none", "off", "single"}
+    if is_quad or any(detection.camera_view for detection in yolo_result.detections):
+        lines.insert(
+            4,
+            "The source video is a 2x2 mosaic. YOLO ran separately on each quadrant "
+            "(front=top-left, rear=top-right, left=bottom-left, right=bottom-right unless notes say otherwise). "
+            "Do not report the same hazard more than once when detections share the same time.",
+        )
 
     if not yolo_result.detections:
         lines.append("- (none)")
@@ -592,6 +604,8 @@ def _build_yolo_prompt_section(
             if detection.bbox:
                 bbox_text = ", ".join(f"{value:.1f}" for value in detection.bbox[:4])
                 parts.append(f"bbox=[{bbox_text}]")
+            if detection.camera_view:
+                parts.append(f"view={detection.camera_view}")
             lines.append("- " + ", ".join(parts))
 
         if len(yolo_result.detections) > 40:
@@ -622,6 +636,8 @@ def _build_yolo_prompt_section(
             "do not require perfect clarity if the object class and scene are consistent.",
             "- Prefer clip-relative timestamps that align with detection times or visible evidence.",
             "- Ignore YOLO classes that cannot map to any listed inspection rule.",
+            "- If detections include view=, they are mosaic tiles of one encoded picture; "
+            "report one finding per hazard at that time, not one per camera.",
             "=== End YOLO context ===",
         ]
     )
@@ -828,6 +844,7 @@ def _split_yolo_result_for_clip(full_result: YoloClipResult, clip: PreparedClip)
                 confidence=detection.confidence,
                 time_sec=detection.time_sec - window_start,
                 bbox=list(detection.bbox),
+                camera_view=detection.camera_view,
             )
         )
 
@@ -856,6 +873,7 @@ def _invoke_yolo_rtsp(
         "rtsp_transport": rtsp_transport,
         "segment_index": segment_index,
         "segment_start_sec": segment_start_sec,
+        "frame_layout": YOLO_FRAME_LAYOUT,
     }
     request_timeout = max(YOLO_REQUEST_TIMEOUT_SECONDS, int(duration_sec) + 30)
     last_error: Exception | None = None
@@ -990,6 +1008,7 @@ def _merge_yolo_segment_results(
                     confidence=detection.confidence,
                     time_sec=global_time_sec,
                     bbox=list(detection.bbox),
+                    camera_view=detection.camera_view,
                 )
             )
         raw_segments.append(
@@ -1047,7 +1066,10 @@ def _invoke_yolo(*, clip: PreparedClip) -> YoloClipResult:
     for attempt in range(1, max_attempts + 1):
         try:
             body, content_type = _encode_multipart(
-                fields={"clip_index": str(clip.index)},
+                fields={
+                    "clip_index": str(clip.index),
+                    "frame_layout": YOLO_FRAME_LAYOUT,
+                },
                 files={"file": (clip.path.name, video_bytes, "video/mp4")},
             )
             headers = {"Content-Type": content_type}
@@ -1193,12 +1215,16 @@ def _normalize_detection_items(items: object, *, default_time_sec: float | None 
                 if value is not None:
                     bbox.append(float(value))
 
+        camera_view = item.get("camera_view") or item.get("view") or item.get("tile")
+        camera_view_text = str(camera_view).strip() if camera_view not in (None, "") else None
+
         normalized.append(
             YoloDetectionPayload(
                 class_name=class_name,
                 confidence=max(0.0, min(1.0, confidence)),
                 time_sec=time_sec,
                 bbox=bbox,
+                camera_view=camera_view_text,
             )
         )
     return normalized

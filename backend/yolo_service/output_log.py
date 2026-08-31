@@ -25,6 +25,7 @@ def _serialize_detection(item: object) -> dict[str, object]:
         "confidence": getattr(item, "confidence", 0.0),
         "time_sec": getattr(item, "time_sec", None),
         "bbox": list(getattr(item, "bbox", []) or []),
+        "camera_view": getattr(item, "camera_view", None),
     }
 
 
@@ -40,6 +41,9 @@ def _format_detection_line(detection: dict[str, object]) -> str:
     if isinstance(bbox, list) and bbox:
         bbox_text = ", ".join(f"{float(value):.1f}" for value in bbox[:4])
         parts.append(f"bbox=[{bbox_text}]")
+    camera_view = detection.get("camera_view")
+    if camera_view:
+        parts.append(f"view={camera_view}")
     return "- " + ", ".join(parts)
 
 

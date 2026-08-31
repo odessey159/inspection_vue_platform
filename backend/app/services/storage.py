@@ -1,16 +1,52 @@
-"""Project runtime paths, JSON helpers, and cross-platform path resolution."""
+"""Vehicle workspace paths, JSON helpers, and cross-platform path resolution."""
 
 from __future__ import annotations
 
 import json
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from ..settings import PROJECTS_DIR
+from ..settings import PROJECTS_DIR, ROBOTS_DIR
+
+if TYPE_CHECKING:
+    from ..models import Project
+
+OFFLINE_WORKSPACE_ID = "offline"
+_WORKSPACE_SUBDIRS = (
+    "artifacts",
+    "manifests",
+    "scenes",
+    "summaries",
+    "extracted",
+    "evidence_frames",
+)
 
 
-def ensure_project_dirs(project_id: int) -> dict[str, Path]:
-    root = PROJECTS_DIR / str(project_id)
+def sanitize_workspace_key(raw: str | None) -> str:
+    cleaned = (raw or "").strip()
+    if not cleaned or cleaned in {".", ".."} or "/" in cleaned or "\\" in cleaned:
+        return OFFLINE_WORKSPACE_ID
+    return cleaned
+
+
+def project_workspace_id(project: Project) -> str:
+    """Stable per-vehicle directory name under ``.runtime/robots/<id>/``."""
+    vehicle_id = getattr(project, "vehicle_id", None)
+    if vehicle_id and str(vehicle_id).strip():
+        return sanitize_workspace_key(str(vehicle_id))
+    topic = (getattr(project, "point_topic", None) or "").strip()
+    if topic and not topic.startswith("/"):
+        return sanitize_workspace_key(topic)
+    return OFFLINE_WORKSPACE_ID
+
+
+def workspace_root(vehicle_id: str | None) -> Path:
+    return ROBOTS_DIR / sanitize_workspace_key(vehicle_id)
+
+
+def ensure_project_dirs(vehicle_id: str | None) -> dict[str, Path]:
+    root = workspace_root(vehicle_id)
     artifacts = root / "artifacts"
     manifests = root / "manifests"
     scenes = root / "scenes"
@@ -28,6 +64,40 @@ def ensure_project_dirs(project_id: int) -> dict[str, Path]:
         "extracted": extracted,
         "evidence_frames": evidence_frames,
     }
+
+
+def ensure_project_dirs_for(project: Project) -> dict[str, Path]:
+    """Create the vehicle workspace and copy leftover ``projects/<id>`` files once."""
+    key = project_workspace_id(project)
+    dirs = ensure_project_dirs(key)
+    destination = dirs["root"]
+    legacy_candidates: list[Path] = []
+    if project.artifacts_dir:
+        existing = Path(project.artifacts_dir)
+        if existing.is_dir() and existing.resolve() != destination.resolve():
+            legacy_candidates.append(existing)
+    if project.id is not None:
+        numbered = PROJECTS_DIR / str(project.id)
+        if numbered.is_dir() and numbered.resolve() != destination.resolve():
+            legacy_candidates.append(numbered)
+    for source in legacy_candidates:
+        _copy_missing_workspace_files(source, destination)
+    return dirs
+
+
+def _copy_missing_workspace_files(source: Path, destination: Path) -> None:
+    for name in _WORKSPACE_SUBDIRS:
+        src_sub = source / name
+        dst_sub = destination / name
+        if not src_sub.exists():
+            continue
+        if dst_sub.exists() and any(dst_sub.iterdir()):
+            continue
+        if src_sub.is_dir():
+            shutil.copytree(src_sub, dst_sub, dirs_exist_ok=True)
+        elif src_sub.is_file():
+            dst_sub.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_sub, dst_sub)
 
 
 def write_json(path: Path, payload: object) -> None:

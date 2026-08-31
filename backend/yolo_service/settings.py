@@ -68,5 +68,9 @@ YOLO_RTSP_SEGMENT_SECONDS = float(os.getenv("YOLO_RTSP_SEGMENT_SECONDS", "10"))
 YOLO_RTSP_TRANSPORT = os.getenv("YOLO_RTSP_TRANSPORT", "tcp").strip().lower()
 YOLO_LOG_DIR = _env_path("YOLO_LOG_DIR", ROOT_DIR / ".runtime" / "YOLO_log")
 YOLO_EXPECTED_CLASSES = int(os.getenv("YOLO_EXPECTED_CLASSES", "19"))
+# quad: crop each frame into a 2x2 mosaic and run YOLO on each tile.
+# full: previous whole-frame path.
+YOLO_FRAME_LAYOUT = os.getenv("YOLO_FRAME_LAYOUT", "quad").strip().lower() or "quad"
+YOLO_QUAD_TILE_LABELS = os.getenv("YOLO_QUAD_TILE_LABELS", "front,rear,left,right").strip()
 
 YOLO_LOG_DIR.mkdir(parents=True, exist_ok=True)

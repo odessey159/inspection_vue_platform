@@ -1,30 +1,14 @@
 #!/usr/bin/env python3
-"""Local RTSP test stream generator for inspection platform development.
+"""Barcode-based RTSP test publisher (fallback timeline).
 
-Uses FFmpeg to publish to an RTSP server such as MediaMTX.
-Requires FFmpeg on PATH, or set FFMPEG_BIN (same env var as the backend).
-
-Publishes two synchronized paths from one FFmpeg process:
-  - video: rtsp://127.0.0.1:18554/live
-  - time:  rtsp://127.0.0.1:18554/time  (mapped scene timeline, loops with video)
-
-Both streams burn a machine-readable binary timestamp barcode (top-left) so
-recorders can sample the RTSP timeline instead of wall-clock recording time.
-
-Default mapped timeline (UTC, matches rosbag scene.json first pose):
-  first frame -> 2026-03-24 05:05:48.518
-  later frames advance 1:1 with video PTS (no end clamp)
-When the source video loops, the mapped timeline restarts from the first frame.
+Default local testing now uses ``generate_rtsp_sei_stream.py``, which embeds
+H.264 pose SEI (``timestamp_ns, x, y, yaw``). This script remains the
+alternative: it burns a timestamp barcode into ``/live`` and ``/time``.
 
 Examples:
-    powershell -ExecutionPolicy Bypass -File backend/tests/start_rtsp_server.ps1
     python backend/tests/generate_rtsp_stream.py
     python backend/tests/generate_rtsp_stream.py --mode quad
-    python backend/tests/generate_rtsp_stream.py --video backend/tests/rtsp_test/inspection.mp4
     python backend/tests/generate_rtsp_stream.py --no-time-stream
-
-Default input: first video file in backend/tests/rtsp_test/
-Default output: rtsp://127.0.0.1:18554/live (+ /time)
 """
 
 from __future__ import annotations
@@ -328,10 +312,11 @@ def _video_overlay_chain(
     start_s: float,
     duration_s: float | None,
     fps: int,
+    include_barcode: bool = True,
 ) -> str:
     display_pts = _mapped_timeline_setpts(start_s=start_s, duration_s=duration_s)
     encode_pts = _encode_timeline_setpts(fps=fps)
-    barcode = _timestamp_barcode_filter()
+    barcode = f"{_timestamp_barcode_filter()}," if include_barcode else ""
     clock = _drawtext_mapped_clock_expr()
     return (
         f"{display_pts},"
@@ -339,7 +324,7 @@ def _video_overlay_chain(
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
         f"drawtext=text='{clock}':"
         f"x=24:y=h-48:fontsize=28:fontcolor=yellow{fontfile},"
-        f"{barcode},"
+        f"{barcode}"
         f"{encode_pts}"
     )
 
@@ -591,7 +576,10 @@ def build_ffmpeg_command(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate a local RTSP test video stream plus a synced looping time channel."
+        description=(
+            "Fallback barcode RTSP publisher (/live + /time). "
+            "Default local testing uses generate_rtsp_sei_stream.py."
+        )
     )
     parser.add_argument(
         "--mode",

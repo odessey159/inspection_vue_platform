@@ -6,6 +6,29 @@ export interface RtspVehicle {
   id: string;
   name: string;
   rtsp_url: string;
+  map_id?: string | null;
+}
+
+export interface VehicleTrajectoryResponse {
+  vehicle_id: string;
+  source: string;
+  trajectory: [number, number, number][];
+  trajectory_timestamps: number[];
+  trajectory_orientations: [number, number, number, number][];
+  point_count: number;
+  updated_at: string;
+}
+
+export interface MapSummary {
+  id: string;
+  name: string;
+  source_path?: string;
+  source_kind?: string;
+  source_type?: string;
+  raw_point_count?: number;
+  render_point_count?: number;
+  created_at?: string;
+  processed_at?: string;
 }
 
 export interface BootstrapResponse {
@@ -16,6 +39,7 @@ export interface BootstrapResponse {
   default_rtsp_url: string;
   default_rtsp_record_seconds: number;
   rtsp_vehicles: RtspVehicle[];
+  maps?: MapSummary[];
   detected_bag_dirs: string[];
   detected_standards_dirs: string[];
   provider_available: boolean;
@@ -92,6 +116,7 @@ export interface ProjectSummary {
   id: number;
   name: string;
   status: string;
+  vehicle_id?: string | null;
   bag_dir: string;
   standards_dir: string;
   video_topic: string | null;

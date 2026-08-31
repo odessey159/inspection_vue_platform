@@ -82,7 +82,7 @@ services:
       - "8010:8010"
     volumes:
       - ./.runtime:/app/.runtime
-      - ./inputs:/app/inputs
+      - ${INPUTS_HOST_DIR:-./inputs}:/app/inputs
     healthcheck:
       test: ["CMD", "python", "-c", "from urllib.request import urlopen; print(urlopen('http://127.0.0.1:8010/healthz').read().decode())"]
       interval: 30s

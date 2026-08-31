@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 runpy.run_path(str(Path(__file__).with_name("_bootstrap.py")))
 
 from app.models import HazardRule, Project
+from app.services.analysis_types import FindingSeed
 from app.services.provider import ProviderResponsePayload
 from app.services.provider_YOLO import YoloClipResult, YoloDetectionPayload
 from app.services import rtsp_yolo_llm_chain
@@ -141,6 +142,108 @@ class RtspYoloLlmChainTest(unittest.TestCase):
         self.assertIsNotNone(result.provider_payload)
         fake_llm.invoke.assert_called_once()
         self.assertIn(11, result.seeds_by_project)
+
+    def test_invoke_llm_step_dedupes_same_time_findings(self) -> None:
+        project = Project(
+            id=11,
+            name="rtsp",
+            status="indexed",
+            bag_dir="rtsp://127.0.0.1:18554/live",
+            standards_dir="/tmp/standards",
+            artifacts_dir="/tmp/project",
+            scene_path="scenes/scene.json",
+        )
+        rule = HazardRule(
+            project_id=11,
+            rule_id="rule-001",
+            domain="industrial-inspection",
+            category="ppe",
+            object_name="person",
+            check_item="helmet",
+            hazard_desc="Missing helmet",
+            legal_basis="",
+            evidence_objects_json='["person"]',
+            severity="high",
+            visual_detectable=True,
+        )
+        state = rtsp_yolo_llm_chain.SegmentReviewState(
+            storage_key="local-demo",
+            rtsp_url="rtsp://127.0.0.1:18554/live",
+            segment_index=1,
+            segment_start_sec=30.0,
+            segment_duration_sec=30.0,
+            yolo_result=YoloClipResult(detections=[], notes=[]),
+            video_start_ts=1_700_000_000_000,
+            selected_model="qwen3.5-plus",
+            projects=[project],
+            rules=[rule],
+            rules_by_id={"rule-001": rule},
+            retrieved_rules=[rule],
+            prepared_clip=rtsp_yolo_llm_chain.PreparedClip(
+                index=1,
+                path=Path(""),
+                start_offset_sec=30.0,
+                duration_sec=30.0,
+                start_ts_ms=1_700_000_000_000,
+                byte_size=0,
+                profile_name="text-only",
+            ),
+            yolo_prompt_section="=== YOLO pre-analysis context ===",
+        )
+        duplicate_seeds = [
+            FindingSeed(
+                rule_id="rule-001",
+                title="Missing helmet",
+                time_start_ms=1_700_000_010_000,
+                time_end_ms=1_700_000_011_000,
+                evidence_frame_ts=[1_700_000_010_000],
+                description="front view",
+                confidence=0.55,
+                severity="high",
+            ),
+            FindingSeed(
+                rule_id="rule-001",
+                title="Missing helmet",
+                time_start_ms=1_700_000_010_400,
+                time_end_ms=1_700_000_011_400,
+                evidence_frame_ts=[1_700_000_010_400],
+                description="rear view",
+                confidence=0.88,
+                severity="high",
+            ),
+        ]
+        fake_llm = MagicMock()
+        fake_response = MagicMock()
+        fake_response.content = '{"findings":[],"notes":[]}'
+        fake_llm.invoke.return_value = fake_response
+        payload = ProviderResponsePayload(findings=[], notes=[])
+
+        with patch("langchain_openai.ChatOpenAI", return_value=fake_llm):
+            with patch(
+                "app.services.rtsp_yolo_llm_chain._normalize_message_content",
+                return_value={"findings": [], "notes": []},
+            ):
+                with patch(
+                    "app.services.rtsp_yolo_llm_chain.ProviderResponsePayload.model_validate",
+                    return_value=payload,
+                ):
+                    with patch(
+                        "app.services.rtsp_yolo_llm_chain._clip_findings_to_seeds",
+                        return_value=duplicate_seeds,
+                    ):
+                        with patch(
+                            "app.services.rtsp_yolo_llm_chain.write_llm_log",
+                            return_value=Path("llm.log"),
+                        ):
+                            with patch(
+                                "app.services.rtsp_yolo_llm_chain.YOLO_SAME_TIME_DEDUPE_WINDOW_MS",
+                                2000,
+                            ):
+                                result = rtsp_yolo_llm_chain._step_invoke_llm(state)
+
+        kept = result.seeds_by_project[11]
+        self.assertEqual(len(kept), 1)
+        self.assertAlmostEqual(kept[0].confidence, 0.88)
 
 
 class RtspYoloMonitorLlmWiringTest(unittest.TestCase):

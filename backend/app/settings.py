@@ -158,11 +158,21 @@ YOLO_CONFIDENCE_THRESHOLD = float(os.getenv("YOLO_CONFIDENCE_THRESHOLD", "0.25")
 YOLO_MAX_RETRIES = int(os.getenv("YOLO_MAX_RETRIES", "2"))
 YOLO_REQUEST_TIMEOUT_SECONDS = int(os.getenv("YOLO_REQUEST_TIMEOUT_SECONDS", "180"))
 YOLO_FAIL_OPEN = os.getenv("YOLO_FAIL_OPEN", "false").strip().lower() in {"1", "true", "yes", "on"}
+# quad (default): split each frame into 2x2 tiles and run YOLO on each crop.
+# full: keep the previous whole-frame YOLO path.
+YOLO_FRAME_LAYOUT = os.getenv("YOLO_FRAME_LAYOUT", "quad").strip().lower() or "quad"
+YOLO_QUAD_TILE_LABELS = os.getenv("YOLO_QUAD_TILE_LABELS", "front,rear,left,right").strip()
+# Collapse findings with the same rule whose start times fall in this window.
+YOLO_SAME_TIME_DEDUPE_WINDOW_MS = int(os.getenv("YOLO_SAME_TIME_DEDUPE_WINDOW_MS", "2000"))
 LLM_LOG_DIR = _env_path("LLM_LOG_DIR", RUNTIME_DIR / "LLM_log")
 
 RULE_DB_PATH = _env_path("RULE_DB_PATH", BACKEND_DIR / "data" / "rules.db")
 OBJECT_ALIASES_PATH = _env_path("OBJECT_ALIASES_PATH", BACKEND_DIR / "config" / "object_aliases.yaml")
 RTSP_VEHICLES_PATH = _env_path("RTSP_VEHICLES_PATH", BACKEND_DIR / "config" / "rtsp_vehicles.yaml")
+RTSP_VEHICLES_OVERRIDE_PATH = _env_path(
+    "RTSP_VEHICLES_OVERRIDE_PATH",
+    RUNTIME_DIR / "rtsp_vehicles.override.yaml",
+)
 RULE_RAG_ENABLED = _env_bool("RULE_RAG_ENABLED", "true")
 RULE_RETRIEVAL_TOP_K = int(os.getenv("RULE_RETRIEVAL_TOP_K", "20"))
 RULE_RAG_FALLBACK_TOP_K = int(os.getenv("RULE_RAG_FALLBACK_TOP_K", "15"))
@@ -217,11 +227,13 @@ SCENE_EGO_SWEEP_SAMPLE_COUNT = int(os.getenv("SCENE_EGO_SWEEP_SAMPLE_COUNT", "12
 CLIP_LENGTH_SECONDS = int(os.getenv("CLIP_LENGTH_SECONDS", "25"))
 
 RTSP_RECORDINGS_DIR = _env_path("RTSP_RECORDINGS_DIR", RUNTIME_DIR / "rtsp_recordings")
-# Per-vehicle runtime layout: .runtime/robots/<vehicle_id>/{recordings,maps}
-# Existing rtsp_recordings/ is left untouched until callers are migrated.
+# Per-vehicle workspace: .runtime/robots/<vehicle_id>/{recordings,artifacts,...}
+# Point-cloud maps live in MAPS_DIR and are referenced by vehicle map_id only.
 ROBOTS_DIR = _env_path("ROBOTS_DIR", RUNTIME_DIR / "robots")
 ROBOT_RECORDINGS_DIRNAME = "recordings"
 ROBOT_MAPS_DIRNAME = "maps"
+# Independent point-cloud catalog (not per-vehicle, not per-project).
+MAPS_DIR = _env_path("MAPS_DIR", RUNTIME_DIR / "maps")
 RTSP_RECORDING_CLEANUP_ENABLED = _env_bool("RTSP_RECORDING_CLEANUP_ENABLED", "false")
 RTSP_RECORDING_CLEANUP_INTERVAL_SECONDS = int(os.getenv("RTSP_RECORDING_CLEANUP_INTERVAL_SECONDS", "300"))
 RTSP_WATCH_ENABLED = _env_bool("RTSP_WATCH_ENABLED", "true")
@@ -237,8 +249,11 @@ RTSP_YOLO_MONITOR_LLM_ENABLED = _env_bool("RTSP_YOLO_MONITOR_LLM_ENABLED", "true
 RTSP_YOLO_MONITOR_LLM_ON_EMPTY = _env_bool("RTSP_YOLO_MONITOR_LLM_ON_EMPTY", "false")
 # Capture a short clip per monitor segment for multimodal LLM review (prefer cut from watchdog recording).
 RTSP_YOLO_MONITOR_CAPTURE_CLIP = _env_bool("RTSP_YOLO_MONITOR_CAPTURE_CLIP", "true")
-# When False the frontend behaves as if always in RTSP-live: point-cloud map panel stays hidden,
-# placeholder scenes are never upgraded, and per-vehicle maps are ignored even when present.
+# RTSP timeline parser. "sei" (default) reads H.264/H.265 user_data_unregistered
+# pose SEI first, then falls back to the burned-in timestamp barcode.
+# Set to "barcode" to skip SEI and keep the previous barcode-only path.
+RTSP_TIMELINE_PARSER = os.getenv("RTSP_TIMELINE_PARSER", "sei").strip().lower() or "sei"
+# When False the 3D map panel stays hidden even if a vehicle has a map_id.
 POINT_CLOUD_ENABLED = _env_bool("POINT_CLOUD_ENABLED", "true")
 
 # Timeout (seconds) for each ffmpeg subprocess that compresses/encodes clip segments.
@@ -254,6 +269,7 @@ RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 RTSP_RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 ROBOTS_DIR.mkdir(parents=True, exist_ok=True)
+MAPS_DIR.mkdir(parents=True, exist_ok=True)
 LLM_LOG_DIR.mkdir(parents=True, exist_ok=True)
 RULE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)

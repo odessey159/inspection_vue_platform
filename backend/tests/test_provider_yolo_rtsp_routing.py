@@ -21,8 +21,14 @@ class ProviderYoloRtspRoutingTest(unittest.TestCase):
     def test_split_yolo_result_for_clip_keeps_window_relative_times(self) -> None:
         full_result = YoloClipResult(
             detections=[
-                YoloDetectionPayload(class_name="powerbox", confidence=0.9, time_sec=1.0, bbox=[1, 2, 3, 4]),
-                YoloDetectionPayload(class_name="human", confidence=0.8, time_sec=26.0, bbox=[5, 6, 7, 8]),
+                YoloDetectionPayload(
+                    class_name="powerbox",
+                    confidence=0.9,
+                    time_sec=1.0,
+                    bbox=[1, 2, 3, 4],
+                    camera_view="left",
+                ),
+                YoloDetectionPayload(class_name="human", confidence=0.8, time_sec=26.0, bbox=[5, 6, 7, 8], camera_view="right"),
             ],
             notes=["source=rtsp"],
             raw_payload={},
@@ -41,12 +47,13 @@ class ProviderYoloRtspRoutingTest(unittest.TestCase):
 
         self.assertEqual(len(clip_result.detections), 1)
         self.assertEqual(clip_result.detections[0].class_name, "human")
+        self.assertEqual(clip_result.detections[0].camera_view, "right")
         self.assertAlmostEqual(clip_result.detections[0].time_sec or 0.0, 1.0)
 
     def test_merge_yolo_segment_results_offsets_detection_times(self) -> None:
         first = YoloClipResult(
             detections=[
-                YoloDetectionPayload(class_name="powerbox", confidence=0.9, time_sec=1.0, bbox=[]),
+                YoloDetectionPayload(class_name="powerbox", confidence=0.9, time_sec=1.0, bbox=[], camera_view="front"),
             ],
             notes=["segment-a"],
             raw_payload={"segment_index": 0},
@@ -69,6 +76,7 @@ class ProviderYoloRtspRoutingTest(unittest.TestCase):
         self.assertEqual(len(merged.detections), 2)
         self.assertAlmostEqual(merged.detections[0].time_sec or 0.0, 1.0)
         self.assertAlmostEqual(merged.detections[1].time_sec or 0.0, 62.0)
+        self.assertEqual(merged.detections[0].camera_view, "front")
         self.assertEqual(merged.raw_payload.get("segment_count"), 2)
 
     @patch("app.services.analysis.run_provider_yolo_rtsp_live_analysis")
@@ -121,10 +129,7 @@ class ProviderYoloRtspRoutingTest(unittest.TestCase):
 
         session.exec.side_effect = _exec
 
-        with patch("app.services.analysis.read_json", return_value={"trajectory": [[0, 0, 0]], "trajectory_timestamps": [0, 60_000]}), patch(
-            "app.services.analysis.resolve_project_path",
-            return_value=Path("scene.json"),
-        ), patch("app.services.analysis.ensure_rtsp_videos_for_analysis") as mock_ensure:
+        with patch("app.services.analysis.ensure_rtsp_videos_for_analysis") as mock_ensure:
             run_analysis(session, project, mode="provider_yolo")
 
         mock_ensure.assert_not_called()

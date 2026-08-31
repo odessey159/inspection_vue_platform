@@ -283,6 +283,8 @@ FastAPI + SQLModel + SQLite
 4. 将检测结果 + 规则 + 视频帧送入大模型复核
 5. 写入 findings / hazard zone / 证据帧
 
+直播画面为 2×2 mosaic 时（默认 `YOLO_FRAME_LAYOUT=quad`），YOLO 对四个象限分别推理，检测框映射回整帧坐标并带 `camera_view`。后续 LLM 仍按整段复核；落盘前对同一 `rule_id`、同一时刻窗口内的隐患去重。`YOLO_FRAME_LAYOUT=full` 保留整帧推理旧路径。
+
 RTSP 直播路径还可由 `rtsp_yolo_monitor` 持续分段检测，并经 `rtsp_yolo_llm_chain` 异步复核。
 
 ## 6. RTSP 时间轴与场景同步
@@ -290,12 +292,15 @@ RTSP 直播路径还可由 `rtsp_yolo_monitor` 持续分段检测，并经 `rtsp
 目标：视频播放时钟与三维轨迹时间戳共用同一原点。
 
 ```text
-测试发布端 generate_rtsp_stream
+默认测试发布端 generate_rtsp_sei_stream
+  └─ /live（每帧 H.264 user_data_unregistered SEI：timestamp_ns, x, y, yaw）
+备选 generate_rtsp_stream
   └─ /live + /time（画面内嵌时间戳条码，PTS 映射到地图 epoch）
         |
         v
 rtsp_timeline.resolve_recording_video_start_ts
-  ├─ 优先采样条码
+  ├─ 优先采样 SEI
+  ├─ 其次采样条码
   ├─ 其次车端地图轨迹原点
   └─ 最后墙钟
         |

@@ -20,11 +20,11 @@ export function alignSceneTimestampsToVideo(
   }
 
   const timestamps = scene.trajectory_timestamps ?? [];
-  if (!timestamps.length) {
-    return {
-      ...scene,
-      trajectory_timestamps: [startTs, endTs],
-    };
+  if (!timestamps.length || !(scene.trajectory?.length)) {
+    return scene;
+  }
+  if (scene.scene_quality?.trajectory_source === "rtsp_sei") {
+    return scene;
   }
 
   const mapStart = timestamps[0];

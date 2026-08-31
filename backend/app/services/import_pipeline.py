@@ -4,25 +4,32 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-import shutil
 
-from sqlmodel import Session, select
+from sqlmodel import Session, delete, select
 
-from ..models import Project
-from ..settings import DEFAULT_STANDARDS_DIR, DISCOVERY_ROOTS, PROJECTS_DIR, SECURITY_CHECK_CALIBRATION_PATH, SUPPORTED_VISION_MODELS, VISION_MODEL
-from .dataset import build_dataset_summary, parse_pairs_csv, parse_pose_csv
+from ..models import Finding, HazardRule, HazardZone, Project
+from ..settings import DEFAULT_STANDARDS_DIR, DISCOVERY_ROOTS, PROJECTS_DIR, SUPPORTED_VISION_MODELS, VISION_MODEL
+from .dataset import build_dataset_summary, parse_pairs_csv
 from .extractors import export_camera_lidar_pairs, export_pose_calibration
 from .provider import provider_available
 from .provider_YOLO import provider_yolo_available, yolo_available
 from .rosbag import is_rosbag_dir, parse_rosbag_summary
 from .rtsp_recorder import DEFAULT_RTSP_RECORD_SECONDS, DEFAULT_RTSP_URL
+from .maps import list_maps
 from .rtsp_vehicles import is_point_cloud_enabled, point_cloud_settings_payload, rtsp_vehicle_payloads
 from .rtsp_auto_analysis import rtsp_auto_analysis_settings_payload
 from .rtsp_watchdog import rtsp_watch_settings_payload
 from .runtime import compact_project_runtime
 from .rules import export_rules_payload, parse_rules, sync_rules_to_db
-from .scene import build_scene
-from .storage import ensure_project_dirs, read_json, to_project_relative_path, write_json
+from .storage import (
+    OFFLINE_WORKSPACE_ID,
+    ensure_project_dirs_for,
+    project_workspace_id,
+    sanitize_workspace_key,
+    to_project_relative_path,
+    workspace_root,
+    write_json,
+)
 from .video import build_video
 
 SAMPLE_SCENE_PATH = Path(__file__).resolve().parents[2] / "tests" / "pcd" / "scene.json"
@@ -44,6 +51,7 @@ def bootstrap_paths() -> dict[str, object]:
         "default_rtsp_url": DEFAULT_RTSP_URL,
         "default_rtsp_record_seconds": DEFAULT_RTSP_RECORD_SECONDS,
         "rtsp_vehicles": rtsp_vehicle_payloads(),
+        "maps": [record.payload() for record in list_maps()],
         "detected_bag_dirs": bag_dirs,
         "detected_standards_dirs": standards_dirs,
         "provider_available": provider_available(),
@@ -94,107 +102,225 @@ def is_pcd_import_source(path: Path) -> bool:
     return is_static_scene_import_source(path)
 
 
-def list_projects(session: Session) -> list[Project]:
-    return list(session.exec(select(Project).order_by(Project.created_at.desc())))
+def backfill_vehicle_workspaces() -> None:
+    """Assign vehicle_id and copy leftover ``projects/<id>`` dirs into ``robots/<vehicle>``."""
+    from ..db import engine
+
+    with Session(engine) as session:
+        rows = list(session.exec(select(Project).order_by(Project.updated_at.desc())))
+        for project in rows:
+            key = (project.vehicle_id or "").strip()
+            if not key:
+                topic = (project.point_topic or "").strip()
+                if topic and not topic.startswith("/"):
+                    key = sanitize_workspace_key(topic)
+                elif (project.bag_dir or "").strip().lower().startswith("rtsp://"):
+                    from .rtsp_recorder import resolve_storage_key_for_rtsp_url
+
+                    try:
+                        key = sanitize_workspace_key(resolve_storage_key_for_rtsp_url(project.bag_dir.strip()))
+                    except ValueError:
+                        key = OFFLINE_WORKSPACE_ID
+                else:
+                    key = OFFLINE_WORKSPACE_ID
+                project.vehicle_id = key
+            dirs = ensure_project_dirs_for(project)
+            project.artifacts_dir = str(dirs["root"])
+            session.add(project)
+        session.commit()
 
 
-def import_static_scene_project(session: Session, name: str, scene_source: Path, standards_dir: Path) -> Project:
-    source_scene_path = resolve_scene_path(scene_source)
-    standards_dir = standards_dir.resolve() if str(standards_dir).strip() else Path(".")
-    standards_available = standards_dir.exists() and standards_dir.is_dir() and _is_standards_dir(standards_dir)
+def ensure_configured_vehicle_workspaces() -> None:
+    """Create a lightweight RTSP workspace row for every configured vehicle."""
+    from ..db import engine
+    from .rtsp_vehicles import load_rtsp_vehicles
 
-    project = Project(
-        name=name,
-        status="indexing",
-        bag_dir=str(source_scene_path),
-        standards_dir=str(standards_dir) if standards_available else "",
-        artifacts_dir="",
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
-    )
+    with Session(engine) as session:
+        for vehicle in load_rtsp_vehicles():
+            ensure_rtsp_vehicle_workspace(session, vehicle.id)
+
+
+def ensure_rtsp_vehicle_workspace(
+    session: Session,
+    vehicle_id: str,
+    *,
+    name: str | None = None,
+    standards_dir: str | None = None,
+) -> Project:
+    """Create or refresh a vehicle workspace without starting a recording or clearing findings."""
+    from .rtsp_vehicles import get_vehicle_by_id
+
+    vehicle = get_vehicle_by_id(vehicle_id)
+    if vehicle is None:
+        raise KeyError(f"Unknown RTSP vehicle id: {(vehicle_id or '').strip() or vehicle_id}")
+
+    now = datetime.now(timezone.utc)
+    project = get_project_by_vehicle_id(session, vehicle.id)
+    resolved_standards = (standards_dir or "").strip()
+    if not resolved_standards and project is not None:
+        resolved_standards = (project.standards_dir or "").strip()
+    if not resolved_standards and DEFAULT_STANDARDS_DIR.is_dir():
+        resolved_standards = str(DEFAULT_STANDARDS_DIR)
+
+    if project is None or project.id is None:
+        project = Project(
+            name=(name or "").strip() or vehicle.name,
+            status="watching",
+            vehicle_id=vehicle.id,
+            bag_dir=vehicle.rtsp_url,
+            standards_dir=resolved_standards,
+            artifacts_dir="",
+            point_topic=vehicle.id,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        if project.id is None:
+            raise RuntimeError("Project creation failed")
+        dirs = ensure_project_dirs_for(project)
+        project.artifacts_dir = str(dirs["root"])
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        _seed_rtsp_rules_if_empty(session, project)
+        return project
+
+    project.bag_dir = vehicle.rtsp_url
+    project.vehicle_id = vehicle.id
+    if (name or "").strip():
+        project.name = name.strip()
+    if (standards_dir or "").strip():
+        project.standards_dir = standards_dir.strip()
+    if not project.artifacts_dir:
+        dirs = ensure_project_dirs_for(project)
+        project.artifacts_dir = str(dirs["root"])
+    project.updated_at = now
     session.add(project)
     session.commit()
     session.refresh(project)
-    if project.id is None:
-        raise RuntimeError("Project creation failed")
+    _seed_rtsp_rules_if_empty(session, project)
+    return project
 
-    project_dirs = ensure_project_dirs(project.id)
-    project.artifacts_dir = str(project_dirs["root"])
 
+def _seed_rtsp_rules_if_empty(session: Session, project: Project) -> None:
+    if project.id is None or project.rules_count:
+        return
+    standards = Path(project.standards_dir) if project.standards_dir else None
+    if standards is None or not _is_standards_dir(standards):
+        return
     try:
-        rules = parse_rules(standards_dir, project.id) if standards_available else []
-        rules_path = project_dirs["summaries"] / "rules.json"
-        scene_path = project_dirs["scenes"] / "scene.json"
-        dataset_summary_path = project_dirs["summaries"] / "dataset_summary.json"
-
-        shutil.copy2(source_scene_path, scene_path)
-        scene_payload = read_json(scene_path)
-        if not isinstance(scene_payload, dict) or not scene_payload.get("points"):
-            raise ValueError(f"Invalid scene.json payload: {source_scene_path}")
-
-        if not standards_available:
-            notes = list(scene_payload.get("notes", []))
-            notes.append("Standards directory was not provided; scene-only import with empty rules.")
-            scene_payload["notes"] = notes
-            write_json(scene_path, scene_payload)
-
-        write_json(
-            dataset_summary_path,
-            {
-                "source_type": "static_scene_json",
-                "scene_path": str(source_scene_path),
-                "raw_point_count": int(
-                    scene_payload.get("raw_point_count")
-                    or scene_payload.get("scene_quality", {}).get("input_point_count", 0)
-                    or len(scene_payload.get("points", []))
-                ),
-                "video_start_ts": 0,
-                "video_end_ts": 0,
-                "point_start_ts": 0,
-                "point_end_ts": 0,
-                "median_video_gap_ms": 0,
-                "median_point_gap_ms": 0,
-                "inferred_fps": 0.0,
-                "time_offset_ms": 0,
-            },
-        )
-        write_json(rules_path, export_rules_payload(rules))
-        sync_rules_to_db(rules)
-        for rule in rules:
-            session.add(rule)
-
-        project.status = "indexed"
-        project.video_topic = None
-        project.point_topic = str(source_scene_path)
-        project.pose_topic = "static_scene"
-        project.bag_start_ts = 0
-        project.bag_end_ts = 0
-        project.bag_duration_ms = 0
-        project.message_count = int(
-            scene_payload.get("raw_point_count")
-            or scene_payload.get("scene_quality", {}).get("input_point_count", 0)
-            or len(scene_payload.get("points", []))
-        )
-        project.rules_count = len(rules)
-        project.findings_count = 0
-        project.calibration_required = False
-        project.time_offset_ms = 0
-        project.rules_path = str(rules_path)
-        project.scene_path = to_project_relative_path(project_dirs["root"], scene_path)
-        project.inspection_video_path = None
-        project.updated_at = datetime.now(timezone.utc)
-
-        session.add(project)
-        session.commit()
-        compact_project_runtime(project_dirs["root"])
-        session.refresh(project)
-        return project
+        rules = parse_rules(standards, project.id)
     except Exception:
-        project.status = "failed"
-        project.updated_at = datetime.now(timezone.utc)
+        return
+    if not rules:
+        return
+    project_dirs = ensure_project_dirs_for(project)
+    rules_path = project_dirs["summaries"] / "rules.json"
+    write_json(rules_path, export_rules_payload(rules))
+    sync_rules_to_db(rules)
+    for rule in rules:
+        session.add(rule)
+    project.rules_count = len(rules)
+    project.rules_path = str(rules_path)
+    session.add(project)
+    session.commit()
+    session.refresh(project)
+
+
+def list_projects(session: Session) -> list[Project]:
+    rows = list(session.exec(select(Project).order_by(Project.updated_at.desc())))
+    unique: list[Project] = []
+    seen: set[str] = set()
+    for project in rows:
+        key = (project.vehicle_id or "").strip() or f"id:{project.id}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(project)
+    return unique
+
+
+def get_project_by_vehicle_id(session: Session, vehicle_id: str) -> Project | None:
+    key = sanitize_workspace_key(vehicle_id)
+    return session.exec(
+        select(Project).where(Project.vehicle_id == key).order_by(Project.updated_at.desc())
+    ).first()
+
+
+def _clear_project_records(session: Session, project_id: int) -> None:
+    session.exec(delete(HazardZone).where(HazardZone.project_id == project_id))
+    session.exec(delete(Finding).where(Finding.project_id == project_id))
+    session.exec(delete(HazardRule).where(HazardRule.project_id == project_id))
+    session.commit()
+
+
+def prepare_vehicle_workspace(
+    session: Session,
+    *,
+    name: str,
+    bag_dir: str,
+    standards_dir: str,
+    vehicle_id: str | None,
+    rtsp_vehicle: bool = False,
+) -> Project:
+    """Create or reuse the single workspace row for a vehicle (or the offline workspace)."""
+    key = sanitize_workspace_key(vehicle_id)
+    now = datetime.now(timezone.utc)
+    project = get_project_by_vehicle_id(session, key)
+    if project is not None and project.id is not None:
+        _clear_project_records(session, project.id)
+        project.name = name
+        project.status = "indexing"
+        project.vehicle_id = key
+        project.bag_dir = bag_dir
+        project.standards_dir = standards_dir
+        if rtsp_vehicle:
+            project.point_topic = key
+        project.findings_count = 0
+        project.rules_count = 0
+        project.updated_at = now
         session.add(project)
         session.commit()
-        raise
+        session.refresh(project)
+    else:
+        project = Project(
+            name=name,
+            status="indexing",
+            vehicle_id=key,
+            bag_dir=bag_dir,
+            standards_dir=standards_dir,
+            artifacts_dir="",
+            point_topic=key if rtsp_vehicle else None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+        if project.id is None:
+            raise RuntimeError("Project creation failed")
+
+    project_dirs = ensure_project_dirs_for(project)
+    project.artifacts_dir = str(project_dirs["root"])
+    session.add(project)
+    session.commit()
+    session.refresh(project)
+    return project
+
+
+def import_static_scene_project(
+    session: Session,
+    name: str,
+    scene_source: Path,
+    standards_dir: Path,
+    vehicle_id: str | None = None,
+) -> Project:
+    del session, name, scene_source, standards_dir, vehicle_id
+    raise ValueError(
+        "scene.json / PCD 是独立点云地图，请使用 POST /api/maps/import 导入，再在小车上绑定 map_id。"
+    )
 
 
 def import_pcd_project(session: Session, name: str, pcd_path: Path, standards_dir: Path) -> Project:
@@ -202,35 +328,35 @@ def import_pcd_project(session: Session, name: str, pcd_path: Path, standards_di
     return import_static_scene_project(session, name, pcd_path, standards_dir)
 
 
-def import_project(session: Session, name: str, bag_dir: Path, standards_dir: Path) -> Project:
+def import_project(
+    session: Session,
+    name: str,
+    bag_dir: Path,
+    standards_dir: Path,
+    vehicle_id: str | None = None,
+) -> Project:
     bag_dir = bag_dir.resolve()
     standards_dir = standards_dir.resolve()
 
-    if is_static_scene_import_source(bag_dir):
-        return import_static_scene_project(session, name, bag_dir, standards_dir)
+    if is_static_scene_import_source(bag_dir) and not is_rosbag_dir(bag_dir):
+        raise ValueError(
+            "scene.json / PCD 是独立点云地图，请使用 POST /api/maps/import 导入，再在小车上绑定 map_id。"
+        )
 
     if not is_rosbag_dir(bag_dir):
         raise FileNotFoundError(f"Not a valid rosbag directory: {bag_dir}")
     if not standards_dir.exists() or not standards_dir.is_dir():
         raise FileNotFoundError(f"Standards directory not found: {standards_dir}")
 
-    project = Project(
+    project = prepare_vehicle_workspace(
+        session,
         name=name,
-        status="indexing",
         bag_dir=str(bag_dir),
         standards_dir=str(standards_dir),
-        artifacts_dir="",
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
+        vehicle_id=vehicle_id,
+        rtsp_vehicle=False,
     )
-    session.add(project)
-    session.commit()
-    session.refresh(project)
-    if project.id is None:
-        raise RuntimeError("Project creation failed")
-
-    project_dirs = ensure_project_dirs(project.id)
-    project.artifacts_dir = str(project_dirs["root"])
+    project_dirs = ensure_project_dirs_for(project)
 
     try:
         summary = parse_rosbag_summary(bag_dir)
@@ -251,30 +377,14 @@ def import_project(session: Session, name: str, bag_dir: Path, standards_dir: Pa
 
         pairs = parse_pairs_csv(extracted_pairs_dir / "pairs.csv")
         dataset_summary = build_dataset_summary(pairs)
-        pose_path, pose_topic = _resolve_pose_path(extracted_pose_dir)
-
-        poses = parse_pose_csv(pose_path)
-        valid_pose_path, valid_pose_source = _resolve_pose_validity_path(extracted_pose_dir)
-        valid_pose_reference = parse_pose_csv(valid_pose_path) if valid_pose_path is not None else None
         rules = parse_rules(standards_dir, project.id)
 
         rosbag_summary_path = project_dirs["summaries"] / "rosbag_summary.json"
         dataset_summary_path = project_dirs["summaries"] / "dataset_summary.json"
         rules_path = project_dirs["summaries"] / "rules.json"
-        scene_path = project_dirs["scenes"] / "scene.json"
         video_manifest_path = project_dirs["manifests"] / "video_manifest.json"
         video_output_path = project_dirs["artifacts"] / "inspection.mp4"
 
-        build_scene(
-            pairs,
-            poses,
-            scene_path,
-            pose_topic=pose_topic,
-            calibration_path=SECURITY_CHECK_CALIBRATION_PATH,
-            tf_static_path=extracted_pose_dir / "tf_static.csv",
-            valid_pose_reference=valid_pose_reference,
-            valid_pose_source=valid_pose_source,
-        )
         build_video(
             [pair.image_path for pair in pairs],
             [pair.image_timestamp_ms for pair in pairs],
@@ -294,7 +404,7 @@ def import_project(session: Session, name: str, bag_dir: Path, standards_dir: Pa
         project.status = "indexed"
         project.video_topic = video_topic
         project.point_topic = point_topic
-        project.pose_topic = pose_topic
+        project.pose_topic = None
         project.bag_start_ts = int(summary.get("start_ts_ms") or dataset_summary["video_start_ts"])
         project.bag_end_ts = int(summary.get("end_ts_ms") or dataset_summary["video_end_ts"])
         project.bag_duration_ms = int(summary.get("duration_ms") or (dataset_summary["video_end_ts"] - dataset_summary["video_start_ts"]))
@@ -305,7 +415,7 @@ def import_project(session: Session, name: str, bag_dir: Path, standards_dir: Pa
         project.time_offset_ms = int(dataset_summary["time_offset_ms"])
         project.rosbag_summary_path = str(rosbag_summary_path)
         project.rules_path = str(rules_path)
-        project.scene_path = to_project_relative_path(project_dirs["root"], scene_path)
+        project.scene_path = None
         project.inspection_video_path = to_project_relative_path(project_dirs["root"], video_output_path)
         project.updated_at = datetime.now(timezone.utc)
 
@@ -335,15 +445,26 @@ def project_runtime_paths(project: Project) -> dict[str, Path]:
 
 
 def resolve_inspection_video_url(project: Project) -> str | None:
-    if project.id is None:
-        return None
-    canonical = PROJECTS_DIR / str(project.id) / "artifacts" / "inspection.mp4"
+    key = project_workspace_id(project)
+    canonical = workspace_root(key) / "artifacts" / "inspection.mp4"
     if canonical.is_file() and canonical.stat().st_size > 0:
-        return f"/artifacts/{project.id}/artifacts/inspection.mp4"
+        return f"/artifacts/{key}/artifacts/inspection.mp4"
     if project.inspection_video_path:
-        legacy = Path(project.inspection_video_path)
+        resolved = Path(project.artifacts_dir) / project.inspection_video_path if project.artifacts_dir else Path(project.inspection_video_path)
+        if not resolved.is_file() and Path(project.inspection_video_path).is_file():
+            resolved = Path(project.inspection_video_path)
+        if resolved.is_file() and resolved.stat().st_size > 0:
+            dirs = ensure_project_dirs_for(project)
+            migrated = dirs["artifacts"] / "inspection.mp4"
+            if migrated.is_file() and migrated.stat().st_size > 0:
+                return f"/artifacts/{key}/artifacts/inspection.mp4"
+    if project.id is not None:
+        legacy = PROJECTS_DIR / str(project.id) / "artifacts" / "inspection.mp4"
         if legacy.is_file() and legacy.stat().st_size > 0:
-            return f"/artifacts/{project.id}/artifacts/inspection.mp4"
+            dirs = ensure_project_dirs_for(project)
+            migrated = dirs["artifacts"] / "inspection.mp4"
+            if migrated.is_file() and migrated.stat().st_size > 0:
+                return f"/artifacts/{key}/artifacts/inspection.mp4"
     return None
 
 

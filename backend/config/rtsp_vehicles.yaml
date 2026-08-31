@@ -1,6 +1,7 @@
 # Runtime layout (created on backend startup; does not migrate rtsp_recordings/):
 #   .runtime/robots/<id>/recordings/  — recorded videos
-#   .runtime/robots/<id>/maps/        — point-cloud map files
+#   .runtime/maps/<map_id>/           — standalone point-cloud catalog
+# Vehicles optionally bind a map via map_id (index only; the file is not copied).
 vehicles:
   - id: local-demo
     name: 本地测试巡检车

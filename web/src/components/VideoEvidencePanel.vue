@@ -321,6 +321,16 @@ async function refreshPlaybackState() {
 }
 
 watch(
+  () => activeRtspUrl.value,
+  (nextUrl, previousUrl) => {
+    if (previousUrl && nextUrl && previousUrl !== nextUrl) {
+      liveStreamReady.value = false;
+      liveStreamKey.value += 1;
+    }
+  },
+);
+
+watch(
   [
     () => activeRtspUrl.value,
     () => props.project?.id,

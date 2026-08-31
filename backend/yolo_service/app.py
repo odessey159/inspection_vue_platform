@@ -18,6 +18,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from pydantic import BaseModel, Field
 
 from .detector import YoloVideoDetector
+from .frame_layout import env_frame_layout, resolve_frame_layout
 from .output_log import write_detection_log
 from .settings import (
     YOLO_API_KEY,
@@ -42,6 +43,7 @@ class DetectionPayload(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     time_sec: float | None = None
     bbox: list[float] = Field(default_factory=list)
+    camera_view: str | None = None
 
 
 class PredictVideoResponse(BaseModel):
@@ -56,6 +58,7 @@ class PredictRtspRequest(BaseModel):
     rtsp_transport: str | None = None
     segment_index: int = Field(default=0, ge=0)
     segment_start_sec: float = Field(default=0.0, ge=0.0)
+    frame_layout: str | None = None
 
 
 class PredictRtspSegmentResponse(BaseModel):
@@ -94,6 +97,16 @@ def _resolve_rtsp_segment_duration(duration_sec: float | None) -> float:
     return resolved
 
 
+def _to_detection_payload(item: object) -> DetectionPayload:
+    return DetectionPayload(
+        class_name=getattr(item, "class_name", ""),
+        confidence=float(getattr(item, "confidence", 0.0) or 0.0),
+        time_sec=getattr(item, "time_sec", None),
+        bbox=list(getattr(item, "bbox", []) or []),
+        camera_view=getattr(item, "camera_view", None),
+    )
+
+
 def _build_predict_response(
     *,
     detections: list,
@@ -103,15 +116,7 @@ def _build_predict_response(
     response_notes = list(notes)
     response_notes.insert(0, f"clip_index={clip_index}")
     return PredictVideoResponse(
-        detections=[
-            DetectionPayload(
-                class_name=item.class_name,
-                confidence=item.confidence,
-                time_sec=item.time_sec,
-                bbox=item.bbox,
-            )
-            for item in detections
-        ],
+        detections=[_to_detection_payload(item) for item in detections],
         notes=response_notes,
     )
 
@@ -134,15 +139,7 @@ def _build_rtsp_segment_response(
         segment_index=segment_index,
         segment_start_sec=segment_start_sec,
         segment_duration_sec=segment_duration_sec,
-        detections=[
-            DetectionPayload(
-                class_name=item.class_name,
-                confidence=item.confidence,
-                time_sec=item.time_sec,
-                bbox=item.bbox,
-            )
-            for item in detections
-        ],
+        detections=[_to_detection_payload(item) for item in detections],
         notes=response_notes,
     )
 
@@ -188,6 +185,7 @@ def healthz() -> dict[str, object]:
         "rtsp_max_duration_sec": YOLO_RTSP_MAX_DURATION_SEC,
         "rtsp_segment_seconds": YOLO_RTSP_SEGMENT_SECONDS,
         "log_dir": str(YOLO_LOG_DIR),
+        "frame_layout": env_frame_layout(),
     }
 
 
@@ -200,6 +198,7 @@ def root() -> dict[str, str]:
 async def predict_video(
     file: UploadFile = File(...),
     clip_index: str = Form(default="0"),
+    frame_layout: str | None = Form(default=None),
     _: None = Depends(verify_api_key),
 ) -> PredictVideoResponse:
     if not file.filename:
@@ -219,8 +218,10 @@ async def predict_video(
         loop = asyncio.get_running_loop()
         detections, notes = await loop.run_in_executor(
             None,
-            detector.detect_video,
-            temp_path,
+            lambda: detector.detect_video(
+                temp_path,
+                frame_layout=resolve_frame_layout(frame_layout, default=env_frame_layout()),
+            ),
         )
         response = _build_predict_response(
             detections=detections,
@@ -258,6 +259,7 @@ async def predict_rtsp(
     if rtsp_transport not in {"tcp", "udp"}:
         raise HTTPException(status_code=400, detail="rtsp_transport must be tcp or udp")
 
+    layout = resolve_frame_layout(body.frame_layout, default=env_frame_layout())
     detector = get_detector()
     loop = asyncio.get_running_loop()
     try:
@@ -267,6 +269,7 @@ async def predict_rtsp(
                 rtsp_url,
                 duration_sec=segment_duration_sec,
                 rtsp_transport=rtsp_transport,
+                frame_layout=layout,
             ),
         )
     except ValueError as exc:
@@ -293,6 +296,7 @@ async def predict_rtsp(
             "segment_start_sec": body.segment_start_sec,
             "segment_duration_sec": segment_duration_sec,
             "rtsp_transport": rtsp_transport,
+            "frame_layout": layout,
         },
     )
     logger.info("Wrote YOLO RTSP output log: %s", log_path)

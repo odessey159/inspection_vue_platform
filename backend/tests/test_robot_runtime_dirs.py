@@ -25,7 +25,7 @@ class RobotRuntimeDirsTests(unittest.TestCase):
             self.assertEqual(paths.recordings, robots_root / "local-demo" / "recordings")
             self.assertEqual(paths.maps, robots_root / "local-demo" / "maps")
 
-    def test_ensure_robot_runtime_dirs_creates_per_vehicle_folders(self) -> None:
+    def test_ensure_robot_runtime_dirs_creates_recordings_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             robots_root = Path(tmp_dir) / "robots"
             vehicles = [
@@ -40,7 +40,7 @@ class RobotRuntimeDirsTests(unittest.TestCase):
                 recordings = robots_root / vehicle.id / "recordings"
                 maps = robots_root / vehicle.id / "maps"
                 self.assertTrue(recordings.is_dir())
-                self.assertTrue(maps.is_dir())
+                self.assertFalse(maps.is_dir())
 
 
 if __name__ == "__main__":

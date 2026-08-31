@@ -37,7 +37,9 @@ def cache_evidence_frames(
     evidence_dir.mkdir(parents=True, exist_ok=True)
     removed_bytes = 0
     if replace_all:
-        removed_bytes = remove_paths(list(evidence_dir.glob("frame_*.jpg")))
+        removed_bytes = remove_paths(
+            [*evidence_dir.glob("frame_*.jpg"), *evidence_dir.glob("frame_*.json")]
+        )
 
     timestamps = _finding_timestamps(findings)
     if not timestamps:
@@ -136,6 +138,7 @@ def _extract_frames_parallel(
         return 0
 
     futures = {}
+    pictures = _load_picture_metadata(video_path)
     for timestamp_ms in timestamps:
         output_path = evidence_dir / f"frame_{timestamp_ms}.jpg"
         futures[
@@ -145,6 +148,7 @@ def _extract_frames_parallel(
                 timestamp_ms=timestamp_ms,
                 video_start_ts=video_start_ts,
                 output_path=output_path,
+                pictures=pictures,
             )
         ] = output_path
 
@@ -156,6 +160,7 @@ def _extract_frames_parallel(
         else:
             output_path = futures[future]
             output_path.unlink(missing_ok=True)
+            output_path.with_suffix(".json").unlink(missing_ok=True)
 
     return written
 
@@ -166,6 +171,7 @@ def _extract_one_frame(
     timestamp_ms: int,
     video_start_ts: int,
     output_path: Path,
+    pictures: tuple[object, ...] = (),
 ) -> bool:
     """Run ffmpeg to extract one frame at the given timestamp.  Returns True on success."""
     relative_seconds = max(0.0, (timestamp_ms - video_start_ts) / 1000.0)
@@ -190,4 +196,46 @@ def _extract_one_frame(
     if result.returncode != 0:
         logger.warning("Evidence frame extraction failed at %sms: %s", timestamp_ms, result.stderr.strip() or "unknown")
         return False
+    try:
+        _write_evidence_frame_metadata(output_path, timestamp_ms=timestamp_ms, pictures=pictures)
+    except OSError:
+        logger.warning("Failed to write evidence SEI sidecar for %s", output_path)
     return True
+
+
+def _load_picture_metadata(video_path: Path) -> tuple[object, ...]:
+    try:
+        from .rtsp_timeline import ensure_recording_frame_metadata
+
+        return ensure_recording_frame_metadata(video_path)
+    except Exception:
+        logger.debug("No per-frame pose SEI sidecar for %s", video_path, exc_info=True)
+        return ()
+
+
+def _write_evidence_frame_metadata(
+    image_path: Path,
+    *,
+    timestamp_ms: int,
+    pictures: tuple[object, ...],
+) -> None:
+    from .rtsp_sei import PictureMetadata
+    from .rtsp_timeline import lookup_frame_metadata_for_timestamp
+
+    typed = tuple(item for item in pictures if isinstance(item, PictureMetadata))
+    matched = lookup_frame_metadata_for_timestamp(typed, timestamp_ms) if typed else None
+    payload = {
+        "timestamp_ms": int(timestamp_ms),
+        "image": image_path.name,
+        "frame_index": None if matched is None else matched.frame_index,
+        "timestamp_ns": None if matched is None or matched.metadata is None else matched.metadata.timestamp_ns,
+        "x": None if matched is None or matched.metadata is None else matched.metadata.x,
+        "y": None if matched is None or matched.metadata is None else matched.metadata.y,
+        "yaw": None if matched is None or matched.metadata is None else matched.metadata.yaw,
+        "match": None if matched is None else "nearest",
+    }
+    if matched is not None and matched.metadata is not None:
+        if matched.metadata.timestamp_ms == int(timestamp_ms):
+            payload["match"] = "exact"
+    sidecar = image_path.with_suffix(".json")
+    sidecar.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

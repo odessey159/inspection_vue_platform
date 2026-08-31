@@ -1,12 +1,10 @@
 import runpy
-import shutil
-import tempfile
 import unittest
 from pathlib import Path
 
 runpy.run_path(str(Path(__file__).with_name("_bootstrap.py")))
 
-from app.services.import_pipeline import is_static_scene_import_source, resolve_scene_path
+from app.services.import_pipeline import import_project, is_static_scene_import_source, resolve_scene_path
 from app.services.storage import read_json
 
 SAMPLE_SCENE = Path(__file__).resolve().parent / "pcd" / "scene.json"
@@ -27,15 +25,10 @@ class StaticSceneJsonTest(unittest.TestCase):
         self.assertTrue(is_static_scene_import_source(SAMPLE_PCD_DIR))
         self.assertTrue(is_static_scene_import_source(SAMPLE_SCENE))
 
-    def test_import_copies_scene_json_without_rebuild(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            destination = Path(tmp) / "scenes" / "scene.json"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(SAMPLE_SCENE, destination)
-            copied = read_json(destination)
-            original = read_json(SAMPLE_SCENE)
-            self.assertEqual(len(copied["points"]), len(original["points"]))
-            self.assertEqual(copied.get("source_type"), original.get("source_type"))
+    def test_import_project_rejects_scene_json_as_workspace(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            import_project(None, "map-as-project", SAMPLE_SCENE, SAMPLE_PCD_DIR)
+        self.assertIn("独立点云地图", str(ctx.exception))
 
 
 if __name__ == "__main__":

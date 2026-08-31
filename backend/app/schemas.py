@@ -31,6 +31,44 @@ class RtspVehicleResponse(BaseModel):
     id: str
     name: str
     rtsp_url: str
+    map_id: Optional[str] = None
+
+
+class RtspVehicleUpdateRequest(BaseModel):
+    rtsp_url: str = Field(..., min_length=8)
+
+
+class VehicleMapAssignRequest(BaseModel):
+    map_id: Optional[str] = None
+
+
+class VehicleTrajectoryResponse(BaseModel):
+    vehicle_id: str
+    source: str = "rtsp_sei"
+    trajectory: list[list[float]] = Field(default_factory=list)
+    trajectory_timestamps: list[int] = Field(default_factory=list)
+    trajectory_orientations: list[list[float]] = Field(default_factory=list)
+    point_count: int = 0
+    updated_at: str = ""
+
+
+class MapSummary(BaseModel):
+    id: str
+    name: str
+    source_path: str = ""
+    source_kind: str = "scene_json"
+    source_type: str = ""
+    raw_point_count: int = 0
+    render_point_count: int = 0
+    created_at: str = ""
+    processed_at: str = ""
+
+
+class MapImportRequest(BaseModel):
+    path: str
+    name: Optional[str] = None
+    map_id: Optional[str] = None
+    assign_vehicle_id: Optional[str] = None
 
 
 class BootstrapResponse(BaseModel):
@@ -41,6 +79,7 @@ class BootstrapResponse(BaseModel):
     default_rtsp_url: str
     default_rtsp_record_seconds: float
     rtsp_vehicles: list[RtspVehicleResponse] = Field(default_factory=list)
+    maps: list[MapSummary] = Field(default_factory=list)
     detected_bag_dirs: list[str]
     detected_standards_dirs: list[str]
     provider_available: bool = False
@@ -123,6 +162,7 @@ class ProjectSummary(BaseModel):
     id: int
     name: str
     status: str
+    vehicle_id: Optional[str] = None
     bag_dir: str
     standards_dir: str
     video_topic: Optional[str]

@@ -10,10 +10,13 @@ from fastapi.staticfiles import StaticFiles
 from .db import create_db_and_tables
 from .routers.findings import router as findings_router
 from .routers.projects import router as projects_router
+from .services.import_pipeline import backfill_vehicle_workspaces, ensure_configured_vehicle_workspaces
+from .services.maps import migrate_legacy_vehicle_maps
 from .services.rtsp_recorder import start_rtsp_recording_cleanup_worker, stop_rtsp_recording_cleanup_worker
 from .services.rtsp_vehicles import ensure_robot_runtime_dirs
 from .services.rtsp_watchdog import start_rtsp_watchdog, stop_rtsp_watchdog
-from .settings import CORS_ORIGINS, PROJECTS_DIR
+from .services.vehicle_trajectory import backfill_vehicle_trajectories_from_recordings
+from .settings import CORS_ORIGINS, ROBOTS_DIR
 
 
 @asynccontextmanager
@@ -21,6 +24,10 @@ async def lifespan(_app: FastAPI):
     """Boot DB + robot dirs, then run RTSP cleanup/watchdog for the process lifetime."""
     create_db_and_tables()
     ensure_robot_runtime_dirs()
+    migrate_legacy_vehicle_maps()
+    backfill_vehicle_trajectories_from_recordings()
+    backfill_vehicle_workspaces()
+    ensure_configured_vehicle_workspaces()
     start_rtsp_recording_cleanup_worker()
     start_rtsp_watchdog()
     try:
@@ -48,7 +55,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.include_router(projects_router)
 app.include_router(findings_router)
-app.mount("/artifacts", StaticFiles(directory=PROJECTS_DIR), name="artifacts")
+app.mount("/artifacts", StaticFiles(directory=ROBOTS_DIR), name="artifacts")
 
 
 @app.get("/healthz")

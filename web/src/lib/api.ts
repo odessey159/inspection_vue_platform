@@ -4,6 +4,7 @@ import type {
   FindingPatchResponse,
   FindingResponse,
   ImageSceneRebuildResponse,
+  MapSummary,
   PointCloudSettingsResponse,
   ProjectImportPayload,
   ProjectSummary,
@@ -15,6 +16,8 @@ import type {
   SceneRebuildResponse,
   SceneResponse,
   SceneSource,
+  RtspVehicle,
+  VehicleTrajectoryResponse,
 } from "../types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -74,9 +77,46 @@ export function getRtspPlaybackState(rtspUrl: string, projectId?: number | null)
   return request<RtspPlaybackState>(`/api/rtsp-playback-state?${params.toString()}`);
 }
 
-/** Load a vehicle onboard map (transport-compacted scene.json) for preview. */
+/** Load the catalog map referenced by a vehicle map_id. 404 means no index. */
 export function getVehicleScene(vehicleId: string) {
   return request<SceneResponse>(`/api/rtsp-vehicles/${encodeURIComponent(vehicleId)}/scene`);
+}
+
+export function getVehicleTrajectory(vehicleId: string) {
+  return request<VehicleTrajectoryResponse>(
+    `/api/rtsp-vehicles/${encodeURIComponent(vehicleId)}/trajectory`,
+  );
+}
+
+export function updateVehicleMapId(vehicleId: string, mapId: string | null) {
+  return request<RtspVehicle>(`/api/rtsp-vehicles/${encodeURIComponent(vehicleId)}/map`, {
+    method: "PATCH",
+    body: JSON.stringify({ map_id: mapId }),
+  });
+}
+
+export function importMap(payload: { path: string; name?: string | null; map_id?: string | null; assign_vehicle_id?: string | null }) {
+  return request<MapSummary>("/api/maps/import", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getMaps() {
+  return request<MapSummary[]>("/api/maps");
+}
+
+export function updateVehicleRtspUrl(vehicleId: string, rtspUrl: string) {
+  return request<RtspVehicle>(`/api/rtsp-vehicles/${encodeURIComponent(vehicleId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ rtsp_url: rtspUrl }),
+  });
+}
+
+export function ensureVehicleWorkspace(vehicleId: string) {
+  return request<ProjectSummary>(`/api/rtsp-vehicles/${encodeURIComponent(vehicleId)}/workspace`, {
+    method: "POST",
+  });
 }
 
 export function getProjects() {

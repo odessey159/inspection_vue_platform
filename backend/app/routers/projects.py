@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -17,6 +16,8 @@ from ..schemas import (
     BootstrapResponse,
     FindingResponse,
     ImageSceneRebuildResponse,
+    MapImportRequest,
+    MapSummary,
     PointCloudSettingsRequest,
     PointCloudSettingsResponse,
     ProjectImportRequest,
@@ -24,43 +25,64 @@ from ..schemas import (
     RuntimeResetResponse,
     RtspPlaybackStateResponse,
     RtspRecordingsClearResponse,
+    RtspVehicleResponse,
+    RtspVehicleUpdateRequest,
     RtspWatchSettingsRequest,
     RtspWatchSettingsResponse,
     RuleResponse,
     SceneRebuildResponse,
     SceneResponse,
+    VehicleMapAssignRequest,
+    VehicleTrajectoryResponse,
     ZoneResponse,
 )
 from ..services.analysis import run_analysis
 from ..services.analysis_summary import read_analysis_summary
 from ..services.evidence import cached_frame_path
-from ..services.import_pipeline import bootstrap_paths, import_project, list_projects, project_runtime_paths, resolve_inspection_video_url
+from ..services.import_pipeline import (
+    bootstrap_paths,
+    ensure_rtsp_vehicle_workspace,
+    import_project,
+    list_projects,
+    project_runtime_paths,
+    resolve_inspection_video_url,
+)
 from ..services.provider import provider_available
 from ..services.provider_YOLO import provider_yolo_available, yolo_available
 from ..services.runtime import reset_runtime_storage
+from ..services.maps import (
+    get_map,
+    import_map,
+    list_maps,
+    load_map_for_vehicle_id,
+    load_map_scene,
+)
 from ..services.rtsp_recorder import (
+    align_scene_timestamps_to_video,
     build_rtsp_playback_state,
     clear_rtsp_recordings,
     find_latest_completed_recording_for_storage_key,
     import_rtsp_project,
     is_rtsp_project,
-    maybe_upgrade_rtsp_placeholder_scene,
+    resolve_project_rtsp_url,
+    resolve_project_vehicle_id,
     summarize_rtsp_playback_fields,
 )
 from ..services.rtsp_vehicles import (
-    find_robot_map_scene,
     get_vehicle_by_id,
     is_point_cloud_enabled,
     point_cloud_settings_payload,
     set_point_cloud_enabled,
+    update_vehicle_map_id,
+    update_vehicle_rtsp_url,
 )
-from ..services.rtsp_watchdog import rtsp_watch_settings_payload, set_rtsp_watch_test_mode
+from ..services.rtsp_watchdog import restart_watch_for_vehicle, rtsp_watch_settings_payload, set_rtsp_watch_test_mode
 from ..services.rtsp_yolo_monitor import start_rtsp_yolo_monitor, stop_rtsp_yolo_monitor
 from ..services.rtsp_live import MJPEG_BOUNDARY, iter_mjpeg_multipart_frames
+from ..services.vehicle_trajectory import load_vehicle_trajectory
 from ..services.scene_rebuild import rebuild_project_scene
 from ..services.sfm_reconstruction import rebuild_project_sfm_scene, sfm_scene_exists, sfm_scene_path
-from ..services.storage import read_json, resolve_project_path, to_project_relative_path
-from ..services.scene_transport import compact_scene_payload, load_compact_scene_json
+from ..services.storage import read_json, resolve_project_path
 
 
 router = APIRouter(prefix="/api", tags=["projects"])
@@ -147,9 +169,56 @@ def get_latest_rtsp_recording(storage_key: str) -> FileResponse:
     return FileResponse(recording_path, media_type="video/mp4", filename=recording_path.name)
 
 
+@router.patch("/rtsp-vehicles/{vehicle_id}", response_model=RtspVehicleResponse)
+def patch_rtsp_vehicle(
+    vehicle_id: str,
+    payload: RtspVehicleUpdateRequest,
+    session: Session = Depends(get_session),
+) -> RtspVehicleResponse:
+    """Update a vehicle RTSP URL from the frontend; persists and takes effect immediately."""
+    try:
+        vehicle = update_vehicle_rtsp_url(vehicle_id, payload.rtsp_url)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to persist vehicle RTSP URL: {exc}") from exc
+
+    _sync_vehicle_workspace_url(session, vehicle.id, vehicle.rtsp_url)
+    restart_watch_for_vehicle(vehicle.id)
+    return RtspVehicleResponse(id=vehicle.id, name=vehicle.name, rtsp_url=vehicle.rtsp_url, map_id=vehicle.map_id)
+
+
+@router.patch("/rtsp-vehicles/{vehicle_id}/map", response_model=RtspVehicleResponse)
+def patch_rtsp_vehicle_map(vehicle_id: str, payload: VehicleMapAssignRequest) -> RtspVehicleResponse:
+    """Bind or clear a catalog map_id on a vehicle. Does not copy map files."""
+    try:
+        vehicle = update_vehicle_map_id(vehicle_id, payload.map_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to persist vehicle map index: {exc}") from exc
+    return RtspVehicleResponse(id=vehicle.id, name=vehicle.name, rtsp_url=vehicle.rtsp_url, map_id=vehicle.map_id)
+
+
+@router.post("/rtsp-vehicles/{vehicle_id}/workspace", response_model=ProjectSummary)
+def post_rtsp_vehicle_workspace(vehicle_id: str, session: Session = Depends(get_session)) -> ProjectSummary:
+    """Open or create the vehicle workspace without importing a recording."""
+    try:
+        project = ensure_rtsp_vehicle_workspace(session, vehicle_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _project_summary(project)
+
+
 @router.get("/rtsp-vehicles/{vehicle_id}/scene", response_model=SceneResponse)
 def get_vehicle_scene(vehicle_id: str) -> SceneResponse:
-    """Load the selected vehicle's onboard map for immediate frontend preview."""
+    """Load the catalog map referenced by this vehicle's map_id, plus its RTSP trajectory."""
     cleaned = vehicle_id.strip()
     if not cleaned or cleaned in {".", ".."} or "/" in cleaned or "\\" in cleaned:
         raise HTTPException(status_code=400, detail="Invalid vehicle id")
@@ -158,19 +227,17 @@ def get_vehicle_scene(vehicle_id: str) -> SceneResponse:
     vehicle = get_vehicle_by_id(cleaned)
     if vehicle is None:
         raise HTTPException(status_code=404, detail=f"Unknown RTSP vehicle id: {cleaned}")
-    map_path = find_robot_map_scene(vehicle.id)
-    if map_path is None:
+    if not vehicle.map_id:
         raise HTTPException(
             status_code=404,
-            detail=f"No scene.json map found for vehicle '{vehicle.id}' under robots/{vehicle.id}/maps/",
+            detail=f"Vehicle '{vehicle.id}' has no map_id",
         )
 
-    try:
-        payload = load_compact_scene_json(map_path)
-    except (OSError, ValueError, TypeError) as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid vehicle map scene.json: {exc}") from exc
+    payload = load_map_for_vehicle_id(cleaned)
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"Map '{vehicle.map_id}' has no processed scene.json")
     notes = list(payload.get("notes", [])) if isinstance(payload.get("notes"), list) else []
-    preview_note = f"已加载车端地图：{vehicle.name}（{vehicle.id}）"
+    preview_note = f"已按索引加载地图 {vehicle.map_id}（{vehicle.name}）"
     if preview_note not in notes:
         notes = [preview_note, *notes]
     payload = {**payload, "notes": notes}
@@ -181,9 +248,65 @@ def get_vehicle_scene(vehicle_id: str) -> SceneResponse:
         **quality,
         "vehicle_id": vehicle.id,
         "vehicle_name": vehicle.name,
-        "map_source": str(map_path),
+        "map_id": vehicle.map_id,
     }
     return _scene_response_from_payload(payload, project_id=0)
+
+
+@router.get("/rtsp-vehicles/{vehicle_id}/trajectory", response_model=VehicleTrajectoryResponse)
+def get_vehicle_trajectory(vehicle_id: str) -> VehicleTrajectoryResponse:
+    cleaned = vehicle_id.strip()
+    if not cleaned or cleaned in {".", ".."} or "/" in cleaned or "\\" in cleaned:
+        raise HTTPException(status_code=400, detail="Invalid vehicle id")
+    vehicle = get_vehicle_by_id(cleaned)
+    if vehicle is None:
+        raise HTTPException(status_code=404, detail=f"Unknown RTSP vehicle id: {cleaned}")
+    record = load_vehicle_trajectory(cleaned)
+    return VehicleTrajectoryResponse(**record.payload())
+
+
+@router.get("/maps", response_model=list[MapSummary])
+def get_maps() -> list[MapSummary]:
+    return [MapSummary(**record.payload()) for record in list_maps()]
+
+
+@router.get("/maps/{map_id}", response_model=MapSummary)
+def get_map_summary(map_id: str) -> MapSummary:
+    record = get_map(map_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Unknown map id: {map_id}")
+    return MapSummary(**record.payload())
+
+
+@router.get("/maps/{map_id}/scene", response_model=SceneResponse)
+def get_map_scene(map_id: str) -> SceneResponse:
+    if not is_point_cloud_enabled():
+        raise HTTPException(status_code=404, detail="Point cloud map is disabled")
+    if get_map(map_id) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown map id: {map_id}")
+    try:
+        payload = load_map_scene(map_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid catalog map: {exc}") from exc
+    return _scene_response_from_payload(payload, project_id=0)
+
+
+@router.post("/maps/import", response_model=MapSummary)
+def post_import_map(payload: MapImportRequest) -> MapSummary:
+    source = Path(payload.path.strip())
+    try:
+        record = import_map(source, name=payload.name, map_id=payload.map_id)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    assign_id = (payload.assign_vehicle_id or "").strip()
+    if assign_id:
+        try:
+            update_vehicle_map_id(assign_id, record.id)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return MapSummary(**record.payload())
 
 
 @router.get("/projects", response_model=list[ProjectSummary])
@@ -211,6 +334,7 @@ def post_import_project(payload: ProjectImportRequest, session: Session = Depend
                 name=payload.name,
                 bag_dir=Path(source),
                 standards_dir=Path(payload.standards_dir),
+                vehicle_id=payload.vehicle_id,
             )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -271,20 +395,24 @@ def get_scene(
     if project is None:
         raise HTTPException(status_code=404, detail="Project scene not found")
 
-    scene_path = _scene_path_for_source(project, source)
-    if scene_path is None or not scene_path.exists():
-        raise HTTPException(status_code=404, detail="Project scene not found")
-    payload = compact_scene_payload(read_json(scene_path))
-    if source == "lidar":
-        payload = maybe_upgrade_rtsp_placeholder_scene(project, scene_path, payload)
-        payload = compact_scene_payload(payload)
-        # Persist portable relative paths so Docker/Linux keeps working after a Windows host write.
-        relative_scene = to_project_relative_path(project.artifacts_dir, scene_path)
-        if project.scene_path != relative_scene:
-            project.scene_path = relative_scene
-            project.updated_at = datetime.now(timezone.utc)
-            session.add(project)
-            session.commit()
+    if source == "sfm":
+        scene_path = _scene_path_for_source(project, source)
+        if scene_path is None or not scene_path.exists():
+            raise HTTPException(status_code=404, detail="Project scene not found")
+        payload = read_json(scene_path)
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid SFM scene payload")
+    else:
+        payload = load_map_for_vehicle_id(resolve_project_vehicle_id(project))
+        if payload is None:
+            raise HTTPException(status_code=404, detail="No point-cloud map bound to this vehicle")
+        quality = payload.get("scene_quality")
+        skip_align = isinstance(quality, dict) and quality.get("trajectory_source") == "rtsp_sei"
+        start_ts = int(project.bag_start_ts or 0)
+        end_ts = int(project.bag_end_ts or 0)
+        if not skip_align and start_ts and end_ts and end_ts > start_ts:
+            payload = align_scene_timestamps_to_video(payload, start_ts, end_ts)
+
     zones = list(session.exec(select(HazardZone).where(HazardZone.project_id == project_id)))
     return _scene_response_from_payload(
         payload,
@@ -364,7 +492,7 @@ def stream_project_rtsp_live(project_id: int, session: Session = Depends(get_ses
     if not is_rtsp_project(project):
         raise HTTPException(status_code=400, detail="Project is not RTSP-sourced")
     try:
-        frame_iter = iter_mjpeg_multipart_frames(project.bag_dir.strip())
+        frame_iter = iter_mjpeg_multipart_frames(resolve_project_rtsp_url(project))
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return StreamingResponse(
@@ -385,16 +513,17 @@ def _project_summary(project: Project) -> ProjectSummary:
     analysis_summary = read_analysis_summary(project)
     scene_url = None
     if project.id is not None:
-        lidar_path = resolve_project_path(project.artifacts_dir or "", project.scene_path, "scenes/scene.json")
-        if lidar_path.exists() or project.scene_path:
+        vehicle = get_vehicle_by_id((project.vehicle_id or "").strip()) if project.vehicle_id else None
+        if vehicle and vehicle.map_id:
             scene_url = f"/api/projects/{project.id}/scene"
     inspection_video_url = resolve_inspection_video_url(project)
     rtsp_live_url = None
     rtsp_recording_active = False
     rtsp_stream_online = False
     rtsp_recorded_video_url = None
-    if is_rtsp_project(project):
-        playback_state = summarize_rtsp_playback_fields(project.bag_dir.strip(), project_id=project.id)
+    live_source = resolve_project_rtsp_url(project) if is_rtsp_project(project) else ""
+    if is_rtsp_project(project) and live_source:
+        playback_state = summarize_rtsp_playback_fields(live_source, project_id=project.id)
         rtsp_live_url = str(playback_state["live_url"])
         rtsp_recording_active = bool(playback_state["recording_active"])
         rtsp_stream_online = bool(playback_state.get("stream_online"))
@@ -406,7 +535,8 @@ def _project_summary(project: Project) -> ProjectSummary:
         id=project.id or 0,
         name=project.name,
         status=project.status,
-        bag_dir=project.bag_dir,
+        vehicle_id=project.vehicle_id,
+        bag_dir=live_source or project.bag_dir,
         standards_dir=project.standards_dir,
         video_topic=project.video_topic,
         point_topic=project.point_topic,
@@ -518,8 +648,8 @@ def _scene_response_from_payload(
 
 def _available_scene_sources(project: Project) -> list[Literal["lidar", "sfm"]]:
     sources: list[Literal["lidar", "sfm"]] = []
-    lidar_path = resolve_project_path(project.artifacts_dir or "", project.scene_path, "scenes/scene.json")
-    if lidar_path.exists():
+    vehicle = get_vehicle_by_id((project.vehicle_id or "").strip()) if project.vehicle_id else None
+    if vehicle and vehicle.map_id:
         sources.append("lidar")
     if sfm_scene_exists(project):
         sources.append("sfm")
@@ -587,6 +717,15 @@ def _finding_response(session: Session, finding: Finding) -> FindingResponse:
         zone=_zone_response(zone) if zone else None,
     )
 
+
+
+def _sync_vehicle_workspace_url(session: Session, vehicle_id: str, rtsp_url: str) -> None:
+    for project in session.exec(select(Project).where(Project.vehicle_id == vehicle_id)).all():
+        if not is_rtsp_project(project):
+            continue
+        project.bag_dir = rtsp_url
+        session.add(project)
+    session.commit()
 
 
 def _safe_int(value) -> int | None:

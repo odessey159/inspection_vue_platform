@@ -283,6 +283,10 @@ Copy-Item .env.example .env
   - 置信度阈值；失败时是否放行继续分析
 - `YOLO_WEIGHTS_PATH` / `YOLO_SERVICE_PORT` / `YOLO_LOG_DIR`
   - 仅 YOLO 服务进程使用
+- `YOLO_FRAME_LAYOUT` / `YOLO_QUAD_TILE_LABELS`
+  - 默认 `quad`：每帧 2×2 切分后分别推理；`full` 为整帧旧路径。象限标签默认 `front,rear,left,right`
+- `YOLO_SAME_TIME_DEDUPE_WINDOW_MS`
+  - 同一规则、同一时刻隐患去重窗口（毫秒，默认 2000）
 
 ### 7.4 RTSP 相关
 

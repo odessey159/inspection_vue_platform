@@ -12,7 +12,12 @@ from ..models import Project
 from ..settings import RTSP_WATCH_AUTO_ANALYSIS_MODE, VISION_MODEL, resolve_vision_model
 from .analysis import run_analysis
 from .analysis_summary import read_analysis_summary
-from .rtsp_recorder import is_rtsp_project, resolve_storage_key_for_rtsp_url
+from .rtsp_recorder import (
+    is_rtsp_project,
+    resolve_project_rtsp_url,
+    resolve_project_vehicle_id,
+    resolve_storage_key_for_rtsp_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,15 +80,23 @@ def schedule_auto_analysis_for_project(project_id: int) -> None:
 
 def list_rtsp_projects_for_storage_key(session: Session, storage_key: str) -> list[Project]:
     matches: list[Project] = []
-    for project in session.exec(select(Project)).all():
+    seen_vehicles: set[str] = set()
+    for project in session.exec(select(Project).order_by(Project.updated_at.desc())).all():
         if not is_rtsp_project(project):
             continue
+        vehicle_id = resolve_project_vehicle_id(project)
+        identity = vehicle_id or f"id:{project.id}"
+        if identity in seen_vehicles:
+            continue
         try:
-            project_key = resolve_storage_key_for_rtsp_url(project.bag_dir.strip())
+            live_url = resolve_project_rtsp_url(project)
+            project_key = resolve_storage_key_for_rtsp_url(live_url)
         except ValueError:
             continue
-        if project_key == storage_key:
-            matches.append(project)
+        if project_key != storage_key and vehicle_id != storage_key:
+            continue
+        seen_vehicles.add(identity)
+        matches.append(project)
     return matches
 
 
@@ -91,8 +104,6 @@ def project_accepts_auto_analysis(project: Project, mode: str) -> bool:
     if mode != "provider_yolo":
         return False
     if project.status in {"indexing", "provider_analyzing"}:
-        return False
-    if not project.scene_path:
         return False
 
     summary = read_analysis_summary(project)

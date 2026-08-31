@@ -2,10 +2,13 @@
 
 On stream-up it starts recording (with RTSP timeline meta), optionally runs the
 YOLO live monitor, and can schedule auto analysis when the stream settles.
+After a recording process exits, per-picture pose SEI is extracted into a
+``.frames.jsonl`` sidecar aligned with the encoded pictures.
 """
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -32,6 +35,8 @@ from .rtsp_recorder import (
 from .rtsp_vehicles import load_rtsp_vehicles
 from .rtsp_yolo_monitor import start_rtsp_yolo_monitor, stop_all_rtsp_yolo_monitors, stop_rtsp_yolo_monitor
 
+logger = logging.getLogger(__name__)
+
 # Ignore brand-new recorder processes in playback-state until they look stable.
 # TCP-only false starts often die within ~1s and used to flicker the UI to "live".
 RECORDING_STABLE_MIN_AGE_SECONDS = 1.5
@@ -45,6 +50,7 @@ _active_by_key: dict[str, _ActiveSession] = {}
 _live_analysis_scheduled_keys: set[str] = set()
 _reserving_urls: set[str] = set()
 _runtime_test_mode_override: bool | None = None
+_live_trajectory_inflight: set[str] = set()
 
 
 def is_rtsp_watch_test_mode() -> bool:
@@ -197,6 +203,12 @@ def _monitor_recording_session(session: _ActiveSession) -> None:
     try:
         session.process.wait()
     finally:
+        try:
+            from .rtsp_timeline import persist_recording_frame_metadata
+
+            persist_recording_frame_metadata(session.output_path, vehicle_id=session.storage_key)
+        except Exception:
+            logger.exception("Failed to persist per-frame pose SEI for %s", session.output_path)
         with _lock:
             current = _active_by_key.get(session.storage_key)
             if current is session:
@@ -204,6 +216,46 @@ def _monitor_recording_session(session: _ActiveSession) -> None:
             _live_analysis_scheduled_keys.discard(session.storage_key)
         stop_rtsp_yolo_monitor(session.storage_key)
         release_stream_recording_lock(session.lock_path)
+
+
+def _configured_url_matches_session(configured_url: str, session_url: str) -> bool:
+    from .rtsp_recorder import _rtsp_url_match_candidates
+
+    return bool(_rtsp_url_match_candidates(configured_url) & _rtsp_url_match_candidates(session_url))
+
+
+def stop_recording_for_storage_key(storage_key: str) -> bool:
+    """Stop the watchdog recorder and YOLO monitor for a vehicle so a new URL can take over."""
+    with _lock:
+        session = _active_by_key.get(storage_key)
+    if session is None:
+        stop_rtsp_yolo_monitor(storage_key)
+        return False
+    if session.process.poll() is None:
+        session.process.terminate()
+        try:
+            session.process.wait(timeout=8)
+        except Exception:
+            session.process.kill()
+    stop_rtsp_yolo_monitor(storage_key)
+    return True
+
+
+def restart_watch_for_vehicle(vehicle_id: str) -> None:
+    stop_recording_for_storage_key(vehicle_id.strip())
+
+
+def _ensure_workspace_for_vehicle(vehicle_id: str) -> None:
+    try:
+        from sqlmodel import Session
+
+        from ..db import engine
+        from .import_pipeline import ensure_rtsp_vehicle_workspace
+
+        with Session(engine) as db:
+            ensure_rtsp_vehicle_workspace(db, vehicle_id)
+    except Exception:
+        logger.debug("Could not ensure RTSP workspace for %s", vehicle_id, exc_info=True)
 
 
 def _watch_loop() -> None:
@@ -228,12 +280,20 @@ def _poll_vehicle(storage_key: str, configured_url: str) -> None:
     """If the vehicle stream is up and not already recorded, start ffmpeg and schedule analysis."""
     with _lock:
         existing = _active_by_key.get(storage_key)
-        if existing is not None:
-            if existing.process.poll() is None:
+
+    if existing is not None:
+        if existing.process.poll() is None:
+            if _configured_url_matches_session(configured_url, existing.rtsp_url):
                 start_rtsp_yolo_monitor(existing.storage_key, existing.rtsp_url)
+                _schedule_live_trajectory_refresh(existing)
                 return
-            _active_by_key.pop(storage_key, None)
-            _live_analysis_scheduled_keys.discard(storage_key)
+            stop_recording_for_storage_key(storage_key)
+            return
+        with _lock:
+            current = _active_by_key.get(storage_key)
+            if current is existing:
+                _active_by_key.pop(storage_key, None)
+                _live_analysis_scheduled_keys.discard(storage_key)
 
     if is_rtsp_watch_test_mode():
         prune_oldest_storage_key_recording_if_over_limit(
@@ -285,7 +345,11 @@ def _poll_vehicle(storage_key: str, configured_url: str) -> None:
             video_start_ts=timeline.timestamp_ms,
             source=timeline.source,
             rtsp_url=rtsp_url,
+            x=timeline.x,
+            y=timeline.y,
+            yaw=timeline.yaw,
         )
+        _seed_vehicle_trajectory_from_timeline(storage_key, timeline)
 
         process = spawn_record_rtsp_until_disconnect(
             rtsp_url=rtsp_url,
@@ -304,6 +368,7 @@ def _poll_vehicle(storage_key: str, configured_url: str) -> None:
         with _lock:
             _active_by_key[storage_key] = session
         registered = True
+        _ensure_workspace_for_vehicle(storage_key)
 
         threading.Thread(
             target=_monitor_recording_session,
@@ -317,3 +382,55 @@ def _poll_vehicle(storage_key: str, configured_url: str) -> None:
             _reserving_urls.discard(normalized)
         if lock_path is not None and not registered:
             release_stream_recording_lock(lock_path)
+
+
+def _seed_vehicle_trajectory_from_timeline(vehicle_id: str, timeline: object) -> None:
+    x = getattr(timeline, "x", None)
+    y = getattr(timeline, "y", None)
+    if x is None or y is None:
+        return
+    try:
+        from .vehicle_trajectory import extend_vehicle_trajectory_from_pose
+
+        extend_vehicle_trajectory_from_pose(
+            vehicle_id,
+            timestamp_ms=int(getattr(timeline, "timestamp_ms", 0) or 0),
+            x=float(x),
+            y=float(y),
+            yaw=getattr(timeline, "yaw", None),
+        )
+    except Exception:
+        logger.debug("Failed seeding vehicle trajectory for %s", vehicle_id, exc_info=True)
+
+
+def _schedule_live_trajectory_refresh(session: _ActiveSession) -> None:
+    with _lock:
+        if session.storage_key in _live_trajectory_inflight:
+            return
+        _live_trajectory_inflight.add(session.storage_key)
+
+    def _work() -> None:
+        try:
+            from .vehicle_trajectory import extend_vehicle_trajectory_from_recording
+
+            extend_vehicle_trajectory_from_recording(
+                session.storage_key,
+                session.output_path,
+                persist_sidecar=False,
+                timeout_sec=8.0,
+            )
+        except Exception:
+            logger.debug(
+                "Live trajectory refresh failed for %s",
+                session.storage_key,
+                exc_info=True,
+            )
+        finally:
+            with _lock:
+                _live_trajectory_inflight.discard(session.storage_key)
+
+    threading.Thread(
+        target=_work,
+        name=f"rtsp-trajectory-{session.storage_key}",
+        daemon=True,
+    ).start()

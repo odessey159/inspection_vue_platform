@@ -111,6 +111,7 @@ export function mergeFindingsSnapshot(
 export function projectMonitorSignature(project: ProjectSummary): string {
   return [
     project.id,
+    project.vehicle_id ?? "",
     project.status,
     project.findings_count,
     project.rtsp_recording_active ? 1 : 0,

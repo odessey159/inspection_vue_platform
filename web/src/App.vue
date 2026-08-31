@@ -16,12 +16,17 @@ import {
   getRules,
   getSceneOptional,
   getVehicleScene,
+  getVehicleTrajectory,
+  importMap,
   importProject,
   patchFinding,
   rebuildScene,
   resetRuntime,
   clearRtspRecordings,
   updateRtspWatchTestMode,
+  updateVehicleMapId,
+  updateVehicleRtspUrl,
+  ensureVehicleWorkspace,
 } from "./lib/api";
 import { alignSceneTimestampsToVideo, sceneTimelineOverlapsVideo } from "./lib/sceneTime";
 import { formatStatusLabel } from "./lib/format";
@@ -81,6 +86,22 @@ const importPanelRef = ref<InstanceType<typeof ImportPanel> | null>(null);
 const FINDINGS_POLL_MS = 5000;
 let findingsPollTimer: number | null = null;
 let findingsPollGeneration = 0;
+let openProjectGeneration = 0;
+
+const headerVehicles = computed(() => {
+  const list = [...(bootstrap.value?.rtsp_vehicles ?? [])];
+  const hasOffline = projects.value.some((project) => project.vehicle_id === "offline");
+  if (hasOffline && !list.some((vehicle) => vehicle.id === "offline")) {
+    list.push({
+      id: "offline",
+      name: "离线 rosbag / scene.json",
+      rtsp_url: "",
+    });
+  }
+  return list;
+});
+
+const currentVehicleId = computed(() => importForm.vehicle_id);
 
 const previewRtspUrl = computed(() => {
   if (currentProject.value) {
@@ -125,18 +146,21 @@ const visualRuleCount = computed(() => {
   return rules.value.filter((rule) => rule.visual_detectable).length;
 });
 
-/** RTSP live: hide map. Recorded/artifact or non-RTSP: show map for timestamp sync. */
+/** Show the 3D map whenever point cloud is enabled; trajectory grows from RTSP even while live. */
 const showSceneMap = computed(() => {
   if (bootstrap.value && bootstrap.value.point_cloud_enabled === false) {
     return false;
   }
-  if (!isCurrentProjectRtsp.value) {
-    return true;
-  }
-  return videoPlaybackMode.value !== "live";
+  return true;
 });
 
 const sceneActiveTimestampMs = computed(() => {
+  if (videoPlaybackMode.value === "live") {
+    const stamps = scene.value?.trajectory_timestamps ?? [];
+    if (stamps.length) {
+      return stamps[stamps.length - 1];
+    }
+  }
   return videoPlaybackTs.value ?? activeEvidenceTs.value;
 });
 
@@ -158,10 +182,13 @@ const statusLabel = computed(() => {
   if (busyLabel.value) {
     return busyLabel.value;
   }
+  if (currentProject.value?.rtsp_recording_active) {
+    return "正在录制 RTSP";
+  }
   if (currentProject.value) {
     return formatStatusLabel(currentProject.value.status);
   }
-  return "等待导入项目";
+  return "等待选择小车";
 });
 
 watch(
@@ -276,6 +303,7 @@ async function refreshLiveFindings() {
     if (generation !== findingsPollGeneration || projectId !== currentProjectId.value) {
       return;
     }
+    await refreshLiveTrajectory();
     if (!projectsMonitorEqual(projects.value, projectPayload)) {
       projects.value = projectPayload;
     }
@@ -305,8 +333,31 @@ async function refreshLiveFindings() {
   }
 }
 
+async function refreshLiveTrajectory() {
+  const vehicleId = currentProject.value?.vehicle_id || importForm.vehicle_id;
+  if (!vehicleId || !scene.value) {
+    return;
+  }
+  try {
+    const payload = await getVehicleTrajectory(vehicleId);
+    if (!scene.value) {
+      return;
+    }
+    scene.value.trajectory = payload.trajectory;
+    scene.value.trajectory_timestamps = payload.trajectory_timestamps;
+    scene.value.trajectory_orientations = payload.trajectory_orientations;
+    scene.value.scene_quality = {
+      ...(scene.value.scene_quality ?? {}),
+      trajectory_source: payload.point_count ? payload.source : null,
+      trajectory_point_count: payload.point_count,
+    };
+  } catch {
+    // Keep the last overlay if the trajectory endpoint is briefly unavailable.
+  }
+}
+
 async function initialize(preferredProjectId: number | null = currentProjectId.value) {
-  setBusy("刷新项目索引...");
+  setBusy("刷新工作区...");
   try {
     const [bootstrapPayload, projectPayload] = await Promise.all([getBootstrap(), getProjects()]);
     bootstrap.value = bootstrapPayload;
@@ -314,8 +365,12 @@ async function initialize(preferredProjectId: number | null = currentProjectId.v
     projects.value = projectPayload;
     fillImportSamples(false);
 
-    const nextProjectId = resolveProjectId(preferredProjectId, projectPayload);
-    if (nextProjectId === null) {
+    const preferredVehicleId =
+      importForm.vehicle_id
+      || projectPayload.find((project) => project.id === preferredProjectId)?.vehicle_id
+      || null;
+    const nextVehicleId = resolveVehicleId(preferredVehicleId, projectPayload, bootstrapPayload.rtsp_vehicles);
+    if (!nextVehicleId) {
       clearProjectArtifacts();
       currentProjectId.value = null;
       syncAnalysisSelection(null);
@@ -323,7 +378,7 @@ async function initialize(preferredProjectId: number | null = currentProjectId.v
       return;
     }
 
-    await openProject(nextProjectId);
+    await openVehicleWorkspaceById(nextVehicleId);
   } catch (error) {
     setError(getErrorMessage(error));
   } finally {
@@ -332,6 +387,7 @@ async function initialize(preferredProjectId: number | null = currentProjectId.v
 }
 
 async function openProject(projectId: number | null) {
+  const generation = ++openProjectGeneration;
   const switchedProject = projectId !== currentProjectId.value;
   invalidateFindingsPoll();
   if (projectId === null) {
@@ -343,6 +399,9 @@ async function openProject(projectId: number | null) {
 
   currentProjectId.value = projectId;
   const project = projects.value.find((item) => item.id === projectId) ?? null;
+  if (project?.vehicle_id) {
+    importForm.vehicle_id = project.vehicle_id;
+  }
   syncAnalysisSelection(project);
   setBusy("加载场景与分析结果...");
   try {
@@ -351,6 +410,9 @@ async function openProject(projectId: number | null) {
       getRules(projectId),
       getFindings(projectId),
     ]);
+    if (generation !== openProjectGeneration) {
+      return;
+    }
     scene.value = scenePayload
       ? alignSceneToProjectVideoClock(scenePayload, project)
       : null;
@@ -367,14 +429,19 @@ async function openProject(projectId: number | null) {
     }
     errorMessage.value = "";
   } catch (error) {
+    if (generation !== openProjectGeneration) {
+      return;
+    }
     scene.value = null;
     rules.value = [];
     findings.value = [];
     selectedFindingId.value = null;
     setError(getErrorMessage(error));
   } finally {
-    clearBusy();
-    scheduleFindingsPoll();
+    if (generation === openProjectGeneration) {
+      clearBusy();
+      scheduleFindingsPoll();
+    }
   }
 }
 
@@ -384,37 +451,57 @@ async function handleImport() {
   errorMessage.value = "";
   const source = importForm.bag_dir.trim();
   if (!source) {
-    setError("请先选择巡检小车，或填写 rosbag 目录 / scene.json 路径。");
+    setError("请填写 rosbag 目录 / scene.json 路径。");
     loading.value = false;
     return;
   }
-  const isRtspImport = source.toLowerCase().startsWith("rtsp://");
-  const isSceneImport =
-    !isRtspImport &&
-    (source.toLowerCase().endsWith("scene.json") || source.toLowerCase().endsWith(".json"));
-  setBusy(
-    isRtspImport
-      ? "关联 RTSP 录制并生成 inspection.mp4..."
-      : isSceneImport
-        ? "读取 scene.json 并加载点云地图..."
-        : "导入 rosbag 并预生成视频 / 场景...",
-  );
+  if (source.toLowerCase().startsWith("rtsp://")) {
+    setError("RTSP 流可用后会自动录制，无需预生成。请直接选择小车。");
+    loading.value = false;
+    return;
+  }
+  const isMapImport =
+    source.toLowerCase().endsWith("scene.json")
+    || source.toLowerCase().endsWith(".pcd")
+    || (source.toLowerCase().endsWith(".json") && source.toLowerCase().includes("scene"));
+  if (isMapImport) {
+    setBusy("导入点云地图并处理...");
+    try {
+      const candidateVehicleId = importForm.vehicle_id.trim();
+      const assignVehicleId = candidateVehicleId && candidateVehicleId !== "offline" ? candidateVehicleId : null;
+      const map = await importMap({
+        path: source,
+        name: importForm.name.trim() || undefined,
+        assign_vehicle_id: assignVehicleId,
+      });
+      const bootstrapPayload = await getBootstrap();
+      bootstrap.value = bootstrapPayload;
+      if (assignVehicleId) {
+        const vehicle = bootstrapPayload.rtsp_vehicles.find((item) => item.id === assignVehicleId);
+        if (vehicle) {
+          await loadSelectedVehicleMap(vehicle);
+        }
+      }
+      setNotice(`地图已导入到独立目录：${map.id}（${map.name}）。${assignVehicleId ? "已绑定到当前小车。" : "在小车上选择该 map_id 后才会显示。"}`);
+    } catch (error) {
+      setError(getErrorMessage(error));
+    } finally {
+      clearBusy();
+      loading.value = false;
+    }
+    return;
+  }
+  setBusy("导入 rosbag 并预生成视频 / 规则...");
   try {
     const project = await importProject({
       name: importForm.name.trim() || "巡检车三维复核工作台",
       bag_dir: source,
       standards_dir: importForm.standards_dir.trim(),
-      vehicle_id: isRtspImport ? (importForm.vehicle_id.trim() || null) : null,
-      rtsp_transport: isRtspImport ? "tcp" : null,
+      vehicle_id: importForm.vehicle_id.trim() || null,
+      rtsp_transport: null,
     });
     await initialize(project.id);
-    setNotice(
-      isRtspImport
-        ? "已关联后台 RTSP 录制；若小车 maps 目录有点云，回放时可与视频时间同步。"
-        : isSceneImport
-          ? "scene.json 导入完成，点云地图已加载。"
-          : "导入完成，inspection.mp4、scene.json 和规则摘要已生成。",
-    );
+    setNotice("导入完成，inspection.mp4 和规则摘要已生成。点云地图请单独导入并绑定 map_id。");
   } catch (error) {
     setError(getErrorMessage(error));
   } finally {
@@ -577,7 +664,7 @@ async function handleRebuildScene() {
   try {
     const result = await rebuildScene(currentProject.value.id);
     await initialize(currentProject.value.id);
-    setNotice(`场景已重建：${result.raw_point_count} 个基础点，${result.render_point_count} 个结构显示点。`);
+    setNotice(`场景已重建并写入独立地图目录：${result.notes?.at(-1) ?? `${result.render_point_count} 个显示点`}。请在小车上绑定 map_id 后显示。`);
   } catch (error) {
     setError(getErrorMessage(error));
   } finally {
@@ -653,52 +740,168 @@ function handleSelectVehicle(vehicle: RtspVehicle) {
   if (!importForm.standards_dir) {
     importForm.standards_dir = bootstrap.value?.sample_standards_dir ?? "";
   }
-  void loadSelectedVehicleMap(vehicle);
+  void openVehicleWorkspace(vehicle);
+}
+
+async function saveVehicleRtspUrl(vehicleId: string, rtspUrl: string) {
+  const cleaned = rtspUrl.trim();
+  if (!cleaned.toLowerCase().startsWith("rtsp://")) {
+    throw new Error("RTSP 地址必须以 rtsp:// 开头");
+  }
+  const updated = await updateVehicleRtspUrl(vehicleId, cleaned);
+  const [bootstrapPayload, projectPayload] = await Promise.all([getBootstrap(), getProjects()]);
+  bootstrap.value = bootstrapPayload;
+  projects.value = projectPayload;
+  const next = bootstrapPayload.rtsp_vehicles.find((item) => item.id === vehicleId) ?? updated;
+  if (importForm.vehicle_id === vehicleId) {
+    importForm.bag_dir = next.rtsp_url;
+    selectedVehicleName.value = next.name;
+  }
+  importPanelRef.value?.applyUpdatedVehicle(next);
+  return next;
+}
+
+async function handleSaveVehicleUrl(vehicleId: string, rtspUrl: string) {
+  loading.value = true;
+  errorMessage.value = "";
+  notice.value = "";
+  setBusy("保存 RTSP 地址...");
+  try {
+    const updated = await saveVehicleRtspUrl(vehicleId, rtspUrl);
+    setNotice(`已更新 ${updated.name} 的 RTSP 地址，实时预览与后台录制会立即使用新地址。`);
+  } catch (error) {
+    setError(getErrorMessage(error));
+  } finally {
+    clearBusy();
+    loading.value = false;
+  }
 }
 
 function handleSelectRosbag() {
   importForm.bag_dir = bootstrap.value?.sample_scene_path || bootstrap.value?.sample_pcd_path || bootstrap.value?.sample_bag_dir || "";
-  importForm.vehicle_id = "";
-  selectedVehicleName.value = "";
+  importForm.vehicle_id = "offline";
+  selectedVehicleName.value = "离线 rosbag / scene.json";
   vehicleMapStatus.value = "idle";
   vehicleMapMessage.value = "";
   vehicleSceneRequestId += 1;
   if (!importForm.standards_dir) {
     importForm.standards_dir = bootstrap.value?.sample_standards_dir ?? "";
   }
+  const project = findProjectForVehicle("offline");
+  if (project) {
+    void openProject(project.id);
+  } else {
+    void openProject(null);
+  }
 }
 
 function handleBackToVehicleSelect() {
-  importForm.bag_dir = "";
-  importForm.vehicle_id = "";
-  selectedVehicleName.value = "";
   vehicleMapStatus.value = "idle";
   vehicleMapMessage.value = "";
-  vehicleSceneRequestId += 1;
-  if (currentProjectId.value === null) {
-    scene.value = null;
-  } else {
-    void openProject(currentProjectId.value);
+}
+
+function handleHeaderVehicleSelect(vehicleId: string) {
+  if (!vehicleId) {
+    importForm.bag_dir = "";
+    importForm.vehicle_id = "";
+    selectedVehicleName.value = "";
+    importPanelRef.value?.resetStep();
+    void openProject(null);
+    return;
+  }
+  if (vehicleId === "offline") {
+    handleSelectRosbag();
+    return;
+  }
+  const vehicle = bootstrap.value?.rtsp_vehicles.find((item) => item.id === vehicleId);
+  if (!vehicle) {
+    return;
+  }
+  importPanelRef.value?.applyVehicle(vehicle);
+  handleSelectVehicle(vehicle);
+}
+
+function findProjectForVehicle(vehicleId: string): ProjectSummary | null {
+  return (
+    projects.value.find((project) => project.vehicle_id === vehicleId)
+    ?? projects.value.find((project) => project.point_topic === vehicleId)
+    ?? null
+  );
+}
+
+function resolveVehicleId(
+  preferred: string | null,
+  candidates: ProjectSummary[],
+  vehicles: RtspVehicle[],
+): string | null {
+  const known = new Set(vehicles.map((vehicle) => vehicle.id));
+  known.add("offline");
+  if (preferred && known.has(preferred)) {
+    return preferred;
+  }
+  const withVehicle = candidates.find((project) => project.vehicle_id && known.has(project.vehicle_id));
+  return withVehicle?.vehicle_id ?? null;
+}
+
+async function openVehicleWorkspace(vehicle: RtspVehicle) {
+  try {
+    await ensureVehicleWorkspace(vehicle.id);
+    projects.value = await getProjects();
+  } catch (error) {
+    setError(getErrorMessage(error));
+  }
+  const project = findProjectForVehicle(vehicle.id);
+  if (project) {
+    await openProject(project.id);
+    if (!hasRenderableScene.value) {
+      await loadSelectedVehicleMap(vehicle);
+    }
+    return;
+  }
+  await openProject(null);
+  importForm.vehicle_id = vehicle.id;
+  importForm.bag_dir = vehicle.rtsp_url;
+  await loadSelectedVehicleMap(vehicle);
+}
+
+async function openVehicleWorkspaceById(vehicleId: string) {
+  if (vehicleId === "offline") {
+    handleSelectRosbag();
+    return;
+  }
+  const vehicle = bootstrap.value?.rtsp_vehicles.find((item) => item.id === vehicleId);
+  if (vehicle) {
+    importPanelRef.value?.applyVehicle(vehicle);
+    await openVehicleWorkspace(vehicle);
+    return;
+  }
+  const project = findProjectForVehicle(vehicleId);
+  if (project) {
+    await openProject(project.id);
   }
 }
 
 async function loadSelectedVehicleMap(vehicle: RtspVehicle) {
   const requestId = ++vehicleSceneRequestId;
+  if (!vehicle.map_id) {
+    scene.value = null;
+    vehicleMapStatus.value = "missing";
+    vehicleMapMessage.value = `${vehicle.name} 未绑定点云地图`;
+    return;
+  }
   vehicleMapStatus.value = "loading";
-  vehicleMapMessage.value = `正在加载 ${vehicle.name} 车端地图...`;
+  vehicleMapMessage.value = `正在按索引加载地图 ${vehicle.map_id}...`;
   errorMessage.value = "";
   notice.value = "";
-  setBusy(`加载 ${vehicle.name} 点云地图...`);
+  setBusy(`加载地图 ${vehicle.map_id}...`);
   try {
     const payload = await getVehicleScene(vehicle.id);
     if (requestId !== vehicleSceneRequestId) {
       return;
     }
-    // Align onboard map timestamps onto the current project's video clock so
-    // playback (video_start_ts + currentTime) hits the matching trajectory pose.
     scene.value = alignSceneToProjectVideoClock(payload, currentProject.value);
     vehicleMapStatus.value = "ready";
-    vehicleMapMessage.value = `已显示 ${vehicle.name}（${vehicle.id}）车端地图`;
+    vehicleMapMessage.value = `已显示地图 ${vehicle.map_id}（${vehicle.name}）`;
     setNotice(vehicleMapMessage.value);
   } catch (error) {
     if (requestId !== vehicleSceneRequestId) {
@@ -706,12 +909,14 @@ async function loadSelectedVehicleMap(vehicle: RtspVehicle) {
     }
     scene.value = null;
     const message = getErrorMessage(error);
-    const missing = /no scene\.json|not found|404/i.test(message);
+    const missing = /no map_id|not found|404/i.test(message);
     vehicleMapStatus.value = missing ? "missing" : "error";
     vehicleMapMessage.value = missing
-      ? `${vehicle.name}（${vehicle.id}）尚未提供 maps/scene.json`
-      : `加载 ${vehicle.name} 地图失败：${message}`;
-    setError(vehicleMapMessage.value);
+      ? `${vehicle.name} 未绑定点云地图`
+      : `加载地图失败：${message}`;
+    if (!missing) {
+      setError(vehicleMapMessage.value);
+    }
   } finally {
     if (requestId === vehicleSceneRequestId) {
       clearBusy();
@@ -719,10 +924,34 @@ async function loadSelectedVehicleMap(vehicle: RtspVehicle) {
   }
 }
 
+async function handleAssignVehicleMap(vehicleId: string, mapId: string | null) {
+  loading.value = true;
+  errorMessage.value = "";
+  try {
+    const updated = await updateVehicleMapId(vehicleId, mapId);
+    const bootstrapPayload = await getBootstrap();
+    bootstrap.value = bootstrapPayload;
+    importPanelRef.value?.applyUpdatedVehicle(updated);
+    const vehicle = bootstrapPayload.rtsp_vehicles.find((item) => item.id === vehicleId) ?? updated;
+    await loadSelectedVehicleMap(vehicle);
+    setNotice(mapId ? `已绑定地图 ${mapId}` : "已清除该车的地图绑定");
+  } catch (error) {
+    setError(getErrorMessage(error));
+  } finally {
+    loading.value = false;
+  }
+}
+
 function alignSceneToProjectVideoClock(
   payload: SceneResponse,
   project: ProjectSummary | null,
 ) {
+  if (!payload.trajectory?.length) {
+    return payload;
+  }
+  if (payload.scene_quality?.trajectory_source === "rtsp_sei") {
+    return payload;
+  }
   const startTs = project?.video_start_ts ?? project?.bag_start_ts ?? null;
   const endTs = project?.video_end_ts ?? project?.bag_end_ts ?? null;
   if (startTs == null || endTs == null || endTs <= startTs) {
@@ -740,28 +969,6 @@ function clearProjectArtifacts() {
   findings.value = [];
   selectedFindingId.value = null;
   activeEvidenceTs.value = null;
-}
-
-function hasPlayableVideo(project: ProjectSummary): boolean {
-  return Boolean(project.inspection_video_url || project.rtsp_recorded_video_url);
-}
-
-function resolveProjectId(preferredId: number | null, candidates: ProjectSummary[]) {
-  const preferred =
-    preferredId !== null ? candidates.find((project) => project.id === preferredId) ?? null : null;
-  // Keep the user's current project even when RTSP video is not ready yet.
-  if (preferred) {
-    return preferred.id;
-  }
-  const withVideo = candidates.find(hasPlayableVideo);
-  if (withVideo) {
-    return withVideo.id;
-  }
-  return candidates[0]?.id ?? null;
-}
-
-function selectProject(projectId: number | null) {
-  void openProject(projectId);
 }
 
 function selectFinding(findingId: number, timestampMs?: number) {
@@ -802,6 +1009,14 @@ function clearBusy() {
 
 function getErrorMessage(error: unknown) {
   if (error instanceof Error) {
+    try {
+      const parsed = JSON.parse(error.message) as { detail?: unknown };
+      if (typeof parsed.detail === "string" && parsed.detail.trim()) {
+        return parsed.detail;
+      }
+    } catch {
+      return error.message;
+    }
     return error.message;
   }
   return "Unexpected error";
@@ -811,8 +1026,8 @@ function getErrorMessage(error: unknown) {
 <template>
   <div class="app-shell">
     <WorkbenchHeader
-      :projects="projects"
-      :current-project-id="currentProjectId"
+      :vehicles="headerVehicles"
+      :current-vehicle-id="currentVehicleId"
       :current-project="currentProject"
       :status-label="statusLabel"
       :loading="loading"
@@ -822,7 +1037,7 @@ function getErrorMessage(error: unknown) {
       @clear-rtsp-recordings="handleClearRtspRecordings"
       @reset-runtime="handleResetRuntime"
       @update-rtsp-watch-test-mode="handleRtspWatchTestModeChange"
-      @select-project="selectProject"
+      @select-vehicle="handleHeaderVehicleSelect"
     />
 
     <section class="control-strip">
@@ -837,12 +1052,17 @@ function getErrorMessage(error: unknown) {
         :selected-vehicle-name="selectedVehicleName"
         :vehicle-map-status="vehicleMapStatus"
         :vehicle-map-message="vehicleMapMessage"
+        :project-id="currentProjectId"
+        :rtsp-recording-active="Boolean(currentProject?.rtsp_recording_active)"
+        :rtsp-stream-online="Boolean(currentProject?.rtsp_stream_online)"
         @update-name="importForm.name = $event"
         @update-bag-dir="importForm.bag_dir = $event"
         @update-standards-dir="importForm.standards_dir = $event"
         @select-vehicle="handleSelectVehicle"
         @select-rosbag="handleSelectRosbag"
         @back-to-vehicle-select="handleBackToVehicleSelect"
+        @save-vehicle-url="handleSaveVehicleUrl"
+        @assign-vehicle-map="handleAssignVehicleMap"
         @import="handleImport"
       />
 
@@ -883,33 +1103,31 @@ function getErrorMessage(error: unknown) {
           </div>
           <span class="panel-tag">
             {{
-              !showSceneMap
-                ? "直播中 · 回放时可查看点云"
-                : scene && hasRenderableScene
-                  ? importForm.vehicle_id && !currentProject
-                    ? `车端地图 · ${selectedVehicleName || importForm.vehicle_id}`
-                    : `激光场景 · ${scene.hazard_zones.length} 个空间标注`
-                  : vehicleMapStatus === "loading"
-                    ? "正在加载车端地图"
-                    : vehicleMapStatus === "missing"
-                      ? "该车暂无点云地图"
-                      : "等待点云地图"
+              scene && hasRenderableScene
+                ? importForm.vehicle_id && !currentProject
+                  ? `车端地图 · ${selectedVehicleName || importForm.vehicle_id}`
+                  : `激光场景 · 轨迹 ${scene.trajectory.length} 点 · ${scene.hazard_zones.length} 个空间标注`
+                : vehicleMapStatus === "loading"
+                  ? "正在加载车端地图"
+                  : vehicleMapStatus === "missing"
+                    ? "未绑定点云地图"
+                    : "等待点云地图"
             }}
           </span>
         </div>
 
         <div class="scene-frame">
           <SceneViewport
-            v-if="showSceneMap"
-            :scene-data="hasRenderableScene ? scene : null"
+            v-if="showSceneMap && hasRenderableScene"
+            :scene-data="scene"
             :selected-finding-id="selectedFindingId"
             :active-timestamp-ms="sceneActiveTimestampMs"
             @select="selectFinding"
             @seek="requestSeek"
           />
-          <div v-else class="scene-live-placeholder">
-            <p>RTSP 直播中不显示点云地图</p>
-            <span>流结束后进入录制回放，可点击轨迹点同步跳转视频时间。</span>
+          <div v-else-if="showSceneMap" class="scene-live-placeholder">
+            <p>该车未绑定点云地图</p>
+            <span>点云地图是独立资产。导入后在小车上选择 map_id 才会显示，没有地图不影响巡检。轨迹来自 RTSP 坐标，不会预先画在地图上。</span>
           </div>
         </div>
 

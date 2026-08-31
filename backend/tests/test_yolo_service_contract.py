@@ -18,6 +18,7 @@ class YoloServiceContractTest(unittest.TestCase):
                     "confidence": 0.91,
                     "time_sec": 1.5,
                     "bbox": [10.0, 20.0, 100.0, 200.0],
+                    "camera_view": "front",
                 },
                 {
                     "class_name": "human",
@@ -33,6 +34,7 @@ class YoloServiceContractTest(unittest.TestCase):
 
         self.assertEqual(len(result.detections), 1)
         self.assertEqual(result.detections[0].class_name, "powerbox")
+        self.assertEqual(result.detections[0].camera_view, "front")
         self.assertEqual(result.notes, ["clip_index=0", "imgsz=960"])
 
 

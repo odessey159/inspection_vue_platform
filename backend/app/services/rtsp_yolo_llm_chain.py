@@ -35,6 +35,7 @@ from ..settings import (
     VISION_MAX_RETRIES,
     VISION_REQUEST_TIMEOUT_SECONDS,
     VISION_TEMPERATURE,
+    YOLO_SAME_TIME_DEDUPE_WINDOW_MS,
     resolve_vision_model,
 )
 from .analysis_summary import read_analysis_summary, write_analysis_summary
@@ -46,6 +47,7 @@ from .provider import (
     _build_prompt,
     _clip_findings_to_seeds,
     _compress_clip,
+    _dedupe_seeds,
     _normalize_message_content,
     provider_available,
 )
@@ -458,10 +460,13 @@ def _step_invoke_llm(state: SegmentReviewState) -> SegmentReviewState:
         raw_content = response.content
         json_payload = _normalize_message_content(raw_content)
         state.provider_payload = ProviderResponsePayload.model_validate(json_payload)
-        seeds = _clip_findings_to_seeds(
-            state.prepared_clip,
-            state.provider_payload,
-            state.rules_by_id,
+        seeds = _dedupe_seeds(
+            _clip_findings_to_seeds(
+                state.prepared_clip,
+                state.provider_payload,
+                state.rules_by_id,
+            ),
+            same_time_window_ms=YOLO_SAME_TIME_DEDUPE_WINDOW_MS,
         )
         for project in state.projects:
             if project.id is None:
@@ -655,20 +660,16 @@ def _persist_seeds_for_project(
         trajectory_timestamps: list[int] = []
         scene_start_ts = int(project.bag_start_ts or timeline_origin_ms or 0)
         scene_duration_ms = max(60_000, int((project.bag_end_ts or segment_end_ts_ms) - scene_start_ts))
-        if project.scene_path:
-            try:
-                from .storage import resolve_project_path
+        try:
+            from .maps import load_map_for_vehicle_id
+            from .rtsp_recorder import resolve_project_vehicle_id
 
-                scene = read_json(
-                    resolve_project_path(project.artifacts_dir, project.scene_path, "scenes/scene.json")
-                )
+            scene = load_map_for_vehicle_id(resolve_project_vehicle_id(project))
+            if scene:
                 trajectory = list(scene.get("trajectory") or [])
                 trajectory_timestamps = [int(value) for value in (scene.get("trajectory_timestamps") or [])]
-                if trajectory_timestamps:
-                    scene_start_ts = int(trajectory_timestamps[0])
-                    scene_duration_ms = max(60_000, int(trajectory_timestamps[-1]) - scene_start_ts)
-            except Exception:
-                logger.exception("Failed to load scene for monitor zone attach on project %s", project_id)
+        except Exception:
+            logger.exception("Failed to load catalog map for monitor zone attach on project %s", project_id)
 
         persisted: list[Finding] = []
         skipped_duplicates = 0

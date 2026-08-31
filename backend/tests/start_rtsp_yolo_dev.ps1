@@ -13,7 +13,7 @@ param(
     One-click local RTSP + YOLO test stack.
 
 .DESCRIPTION
-    Starts MediaMTX, the RTSP publisher (video + time channels), and the YOLO
+    Starts MediaMTX, the RTSP publisher (H.264 pose SEI on /live), and the YOLO
     service. By default each process gets its own PowerShell window so logs stay
     readable. Press Enter in this window to stop everything.
 
@@ -169,15 +169,15 @@ try {
     Write-Host "RTSP + YOLO local test stack"
     Write-Host "  repo:   $RepoRoot"
     Write-Host "  backend:$BackendRoot"
-    Write-Host "  RTSP:   rtsp://127.0.0.1:$RtspPort/live  (+ /time)"
+    Write-Host "  RTSP:   rtsp://127.0.0.1:$RtspPort/live  (pose SEI)"
     Write-Host "  YOLO:   http://${YoloHost}:${YoloPort}/healthz"
 
     if (-not $SkipRtsp) {
         Write-Step "MediaMTX RTSP server"
         Start-MediaMtx -Port $RtspPort
 
-        Write-Step "RTSP publisher (video + time)"
-        $publishCmd = "python `"$TestsDir\generate_rtsp_stream.py`" --port $RtspPort"
+        Write-Step "RTSP publisher (pose SEI)"
+        $publishCmd = "python `"$TestsDir\generate_rtsp_sei_stream.py`" --port $RtspPort"
         $script:ChildProcesses += Start-DevWindow `
             -Title "RTSP Publisher" `
             -WorkingDirectory $RepoRoot `
@@ -205,8 +205,8 @@ try {
 
     Write-Host ""
     Write-Host "Stack is starting." -ForegroundColor Green
-    Write-Host "  video: rtsp://127.0.0.1:$RtspPort/live"
-    Write-Host "  time:  rtsp://127.0.0.1:$RtspPort/time"
+    Write-Host "  video: rtsp://127.0.0.1:$RtspPort/live  (H.264 pose SEI)"
+    Write-Host "  barcode fallback: python backend/tests/generate_rtsp_stream.py"
     if (-not $SkipYolo) {
         Write-Host "  yolo:  http://${YoloHost}:${YoloPort}/healthz"
     }

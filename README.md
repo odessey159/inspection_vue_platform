@@ -211,7 +211,7 @@ inputs/
 #### RTSP 导入
 
 1. 编辑 `backend/config/rtsp_vehicles.yaml`，配置巡检小车 ID、名称与 RTSP 地址。
-2. 确保 RTSP 流可访问（本地测试可用 `backend/tests/start_rtsp_server.ps1` 配合 `generate_rtsp_stream.py`；测试流会同时发布 `/live` 与带时间戳条码的 `/time`）。
+2. 确保 RTSP 流可访问（本地测试默认用 `backend/tests/start_rtsp_server.ps1` 配合 `generate_rtsp_sei_stream.py`，在 `/live` 里写入 H.264 位姿 SEI。旧的画面条码方案仍可用 `generate_rtsp_stream.py` 发布 `/live` 与 `/time`）。
 3. （可选）将车端点云地图放到 `.runtime/robots/<vehicle_id>/maps/scene.json`，前端选车后可立即预览。
 4. 在前端「选择巡检小车」步骤选取车辆，或手动填写 RTSP URL 导入项目。
 
@@ -255,9 +255,9 @@ rosbag 导入时后端会执行：
 `provider_yolo` 典型流程：
 
 1. 将巡检视频切分为 clip
-2. 调用 YOLO 服务 `/predict/video`（或 RTSP 场景下 `/predict/rtsp`）获取检测框与时间戳
+2. 调用 YOLO 服务 `/predict/video`（或 RTSP 场景下 `/predict/rtsp`）获取检测框与时间戳。默认将每帧按 2×2 切成四路分别检测；`YOLO_FRAME_LAYOUT=full` 可改回整帧检测
 3. （可选）通过 Rule RAG 按检测类别检索相关规则
-4. 将 YOLO 结果 + 规则片段 + 视频帧送入大模型生成 findings
+4. 将 YOLO 结果 + 规则片段 + 视频帧送入大模型生成 findings（四路画面仍是一次复核；落盘时对同一时刻同类隐患去重）
 
 ### 4.3 YOLO 推理服务
 
@@ -275,6 +275,9 @@ YOLO 服务位于 `backend/yolo_service/`，与主后端解耦部署。
 - `YOLO_SERVICE_PORT`：默认 `8001`
 - `YOLO_IMGSZ` / `YOLO_CONFIDENCE`：推理尺寸与置信度阈值
 - `YOLO_LOG_DIR`：检测日志输出目录（默认 `.runtime/YOLO_log`）
+- `YOLO_FRAME_LAYOUT`：默认 `quad`（2×2 切分后分别推理）；设为 `full` 可回退到整帧推理
+- `YOLO_QUAD_TILE_LABELS`：四象限标签，默认 `front,rear,left,right`（左上/右上/左下/右下）
+- `YOLO_SAME_TIME_DEDUPE_WINDOW_MS`：同一规则、同一时刻隐患去重窗口（默认 2000）
 
 当前模型支持 19 类工业安全相关目标，类别说明见 `backend/models/YOLO/checklist_YOLO.txt`。
 

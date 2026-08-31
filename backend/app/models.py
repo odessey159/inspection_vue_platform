@@ -14,6 +14,7 @@ class Project(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     status: str = Field(default="indexed", index=True)
+    vehicle_id: Optional[str] = Field(default=None, index=True)
     bag_dir: str
     standards_dir: str
     artifacts_dir: str

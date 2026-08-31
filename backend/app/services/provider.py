@@ -574,14 +574,43 @@ def _clip_findings_to_seeds(
 
 
 
-def _dedupe_seeds(seeds: list[FindingSeed]) -> list[FindingSeed]:
-    deduped: dict[tuple[str, int, int], FindingSeed] = {}
-    for seed in seeds:
-        key = (seed.rule_id, round(seed.time_start_ms / 1000), round(seed.time_end_ms / 1000))
-        current = deduped.get(key)
-        if current is None or seed.confidence > current.confidence:
-            deduped[key] = seed
-    return sorted(deduped.values(), key=lambda item: (item.time_start_ms, item.rule_id))
+def _dedupe_seeds(
+    seeds: list[FindingSeed],
+    *,
+    same_time_window_ms: int | None = None,
+) -> list[FindingSeed]:
+    """Collapse duplicate findings for the same rule.
+
+    Default: round start/end to whole seconds (legacy provider behavior).
+    When ``same_time_window_ms`` is set, also merge same-rule findings whose
+    start times fall within that window (mosaic views of one moment).
+    """
+    if same_time_window_ms is None or int(same_time_window_ms) <= 0:
+        deduped: dict[tuple[str, int, int], FindingSeed] = {}
+        for seed in seeds:
+            key = (seed.rule_id, round(seed.time_start_ms / 1000), round(seed.time_end_ms / 1000))
+            current = deduped.get(key)
+            if current is None or seed.confidence > current.confidence:
+                deduped[key] = seed
+        return sorted(deduped.values(), key=lambda item: (item.time_start_ms, item.rule_id))
+
+    window = int(same_time_window_ms)
+    kept: list[FindingSeed] = []
+    for seed in sorted(seeds, key=lambda item: (item.rule_id, item.time_start_ms, -item.confidence)):
+        match_index = None
+        for index, current in enumerate(kept):
+            if current.rule_id != seed.rule_id:
+                continue
+            if abs(int(current.time_start_ms) - int(seed.time_start_ms)) > window:
+                continue
+            match_index = index
+            break
+        if match_index is None:
+            kept.append(seed)
+            continue
+        if seed.confidence > kept[match_index].confidence:
+            kept[match_index] = seed
+    return sorted(kept, key=lambda item: (item.time_start_ms, item.rule_id))
 
 
 

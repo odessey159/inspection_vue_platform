@@ -37,7 +37,7 @@ MEDIAMTX_NAME = "inspection-rtsp-mediamtx"
 RTSP_PORT = 18554
 YOLO_HOST = "127.0.0.1"
 YOLO_PORT = 8001
-GENERATE_SCRIPT = TESTS_DIR / "generate_rtsp_stream.py"
+GENERATE_SCRIPT = TESTS_DIR / "generate_rtsp_sei_stream.py"
 YOLO_SCRIPT = BACKEND_ROOT / "scripts" / "run_yolo_service.ps1"
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
 ENV_FILE = REPO_ROOT / ".env"
@@ -354,7 +354,6 @@ class DevStackUI:
         urls_body.pack(fill="x", padx=10, pady=10)
         endpoints = (
             ("视频", f"rtsp://127.0.0.1:{RTSP_PORT}/live"),
-            ("时间", f"rtsp://127.0.0.1:{RTSP_PORT}/time"),
             ("YOLO", f"http://{YOLO_HOST}:{YOLO_PORT}/healthz"),
         )
         for row, (label, value) in enumerate(endpoints):
@@ -637,7 +636,7 @@ class DevStackUI:
             if self.stream_proc.poll() is not None:
                 raise RuntimeError("推流进程已退出，请查看「推流」日志中的 ffmpeg 错误")
             time.sleep(0.25)
-        self.log("推流已启动 (video=/live, time=/time)", channel="stream")
+        self.log("推流已启动 (video=/live, H.264 pose SEI)", channel="stream")
 
     def stop_stream(self) -> None:
         self._run_async("stream_off", "关闭推流", self._stop_stream, button=self.btn_stream_off)

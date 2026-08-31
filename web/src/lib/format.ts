@@ -78,6 +78,8 @@ export function formatCoordinate(values: number[] | null | undefined): string {
 
 export function formatStatusLabel(status: string | null | undefined): string {
   switch (status) {
+    case "watching":
+      return "等待 RTSP 流";
     case "indexed":
       return "已完成预生成";
     case "indexing":

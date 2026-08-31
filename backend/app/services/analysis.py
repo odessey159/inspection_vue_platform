@@ -6,18 +6,19 @@ from datetime import datetime, timezone
 from sqlmodel import Session, delete, select
 
 from ..models import Finding, HazardRule, HazardZone, Project
+from ..settings import YOLO_SAME_TIME_DEDUPE_WINDOW_MS
 from .analysis_summary import read_analysis_summary, write_analysis_summary
 from .analysis_types import AnalysisRunResult, AnalysisVideoTarget, FindingSeed
 from .evidence import cache_evidence_frames
-from .provider import provider_available, provider_label, run_provider_analysis
+from .provider import _dedupe_seeds, provider_available, provider_label, run_provider_analysis
 from .provider_YOLO import provider_yolo_available, run_provider_yolo_analysis, run_provider_yolo_rtsp_live_analysis
 from .rtsp_recorder import (
     ensure_rtsp_videos_for_analysis,
     is_rtsp_project,
     load_rtsp_project_settings,
+    resolve_project_vehicle_id,
     should_use_rtsp_live_yolo_analysis,
 )
-from .storage import read_json, resolve_project_path
 
 
 def run_analysis(
@@ -92,14 +93,13 @@ def run_analysis(
         _finalize_project(session, project, result, persisted=[])
         return []
 
-    if not project.scene_path:
-        raise FileNotFoundError("Scene payload is missing")
+    from .maps import load_map_for_vehicle_id
 
-    scene = read_json(resolve_project_path(project.artifacts_dir, project.scene_path, "scenes/scene.json"))
-    trajectory = scene.get("trajectory", [])
-    trajectory_timestamps = scene.get("trajectory_timestamps", [])
-    start_ts = int(scene.get("trajectory_timestamps", [project.bag_start_ts or _now_ms()])[0] or project.bag_start_ts or _now_ms())
-    end_ts = int(scene.get("trajectory_timestamps", [project.bag_end_ts or (start_ts + 180_000)])[-1] or project.bag_end_ts or (start_ts + 180_000))
+    scene = load_map_for_vehicle_id(resolve_project_vehicle_id(project)) or {}
+    trajectory = scene.get("trajectory", []) if isinstance(scene, dict) else []
+    trajectory_timestamps = scene.get("trajectory_timestamps", []) if isinstance(scene, dict) else []
+    start_ts = int(project.bag_start_ts or _now_ms())
+    end_ts = int(project.bag_end_ts or (start_ts + 180_000))
     duration_ms = max(60_000, end_ts - start_ts)
 
     if mode in {"provider", "provider_yolo"}:
@@ -160,7 +160,8 @@ def run_analysis(
         session.add(finding)
         session.flush()
         session.refresh(finding)
-        _attach_zone(session, project.id or 0, finding, trajectory, trajectory_timestamps, start_ts, duration_ms)
+        if trajectory:
+            _attach_zone(session, project.id or 0, finding, trajectory, trajectory_timestamps, start_ts, duration_ms)
         persisted.append(finding)
     session.commit()
 
@@ -223,7 +224,10 @@ def _merge_analysis_results(*, mode: str, model: str | None, partial_results: li
         if result.status in {"provider_analyzed", "demo_analyzed"}:
             successful_runs += 1
 
-    deduped = _dedupe_seeds(merged_findings)
+    deduped = _dedupe_seeds(
+        merged_findings,
+        same_time_window_ms=YOLO_SAME_TIME_DEDUPE_WINDOW_MS if mode == "provider_yolo" else None,
+    )
     if mode == "demo":
         status = "demo_analyzed" if successful_runs > 0 else "indexed"
     else:
@@ -297,16 +301,6 @@ def _run_demo_analysis(
             "diagnostics": [],
         },
     )
-
-
-def _dedupe_seeds(seeds: list[FindingSeed]) -> list[FindingSeed]:
-    deduped: dict[tuple[str, int, int], FindingSeed] = {}
-    for seed in seeds:
-        key = (seed.rule_id, round(seed.time_start_ms / 1000), round(seed.time_end_ms / 1000))
-        current = deduped.get(key)
-        if current is None or seed.confidence > current.confidence:
-            deduped[key] = seed
-    return sorted(deduped.values(), key=lambda item: (item.time_start_ms, item.rule_id))
 
 
 def _finalize_project(session: Session, project: Project, result: AnalysisRunResult, persisted: list[Finding]) -> None:

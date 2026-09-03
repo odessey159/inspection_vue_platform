@@ -89,6 +89,8 @@ const host = ref<HTMLDivElement | null>(null);
 const viewPreset = ref<ViewPreset>("perspective");
 const showRenderControls = ref(false);
 const showPathPoints = ref(true);
+/** Current frame / live pose on the timestamp-aligned trajectory. */
+const showPlaybackMarker = true;
 /** Fade point cloud / backdrop so the trajectory stays readable. */
 const dimNonTrajectory = ref(false);
 const fullHeightMode = ref(true);
@@ -1538,21 +1540,52 @@ function applyPointSizeToCloud() {
   markNeedsRender();
 }
 
-function nearestTrajectoryIndexByTimestamp(sceneData: SceneResponse, targetMs: number) {
+function trajectorySampleByTimestamp(sceneData: SceneResponse, targetMs: number) {
   const timestamps = sceneData.trajectory_timestamps;
   if (!timestamps.length || timestamps.length !== sceneData.trajectory.length) {
-    return -1;
+    return null;
   }
-  let bestIndex = 0;
-  let bestDelta = Number.POSITIVE_INFINITY;
-  timestamps.forEach((timestamp, index) => {
-    const delta = Math.abs(timestamp - targetMs);
-    if (delta < bestDelta) {
-      bestDelta = delta;
-      bestIndex = index;
+  if (targetMs <= timestamps[0]) {
+    return { point: sceneData.trajectory[0], nearestIndex: 0, progressIndex: 0 };
+  }
+  const lastIndex = timestamps.length - 1;
+  if (targetMs >= timestamps[lastIndex]) {
+    return {
+      point: sceneData.trajectory[lastIndex],
+      nearestIndex: lastIndex,
+      progressIndex: lastIndex,
+    };
+  }
+
+  let low = 0;
+  let high = lastIndex;
+  while (low + 1 < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (timestamps[middle] <= targetMs) {
+      low = middle;
+    } else {
+      high = middle;
     }
-  });
-  return bestIndex;
+  }
+  const beforeTs = timestamps[low];
+  const afterTs = timestamps[high];
+  const ratio = Math.max(0, Math.min(1, (targetMs - beforeTs) / Math.max(1, afterTs - beforeTs)));
+  const before = sceneData.trajectory[low];
+  const after = sceneData.trajectory[high];
+  const point: [number, number, number] = [
+    before[0] + (after[0] - before[0]) * ratio,
+    before[1] + (after[1] - before[1]) * ratio,
+    before[2] + (after[2] - before[2]) * ratio,
+  ];
+  return {
+    point,
+    nearestIndex: ratio < 0.5 ? low : high,
+    progressIndex: low,
+  };
+}
+
+function nearestTrajectoryIndexByTimestamp(sceneData: SceneResponse, targetMs: number) {
+  return trajectorySampleByTimestamp(sceneData, targetMs)?.nearestIndex ?? -1;
 }
 
 function nearestTrajectoryIndexByPosition(sceneData: SceneResponse, position: [number, number, number]) {
@@ -1904,9 +1937,8 @@ function updatePlaybackMarker() {
     return;
   }
 
-  const index = nearestTrajectoryIndexByTimestamp(props.sceneData, timestamp);
-  const point = index >= 0 ? props.sceneData.trajectory[index] : null;
-  if (!point) {
+  const sample = trajectorySampleByTimestamp(props.sceneData, timestamp);
+  if (!sample) {
     if (playbackMarker) {
       playbackMarker.visible = false;
       markNeedsRender();
@@ -1924,17 +1956,24 @@ function updatePlaybackMarker() {
     };
   }
 
-  const zLift = clamp(metrics.span * 0.008, 0.22, 0.55);
-  const radius = clamp(metrics.span * 0.01, 0.35, 1.1);
-  const marker = ensurePlaybackMarker(metrics.span);
-  if (!marker) {
-    return;
+  if (playbackMarker) {
+    playbackMarker.visible = false;
   }
-
-  marker.visible = true;
-  marker.scale.setScalar(radius);
-  marker.position.set(point[0], point[1], Math.max(point[2], metrics.min.z) + zLift);
-  updatePathProgressColors(index);
+  if (showPlaybackMarker) {
+    const zLift = clamp(metrics.span * 0.008, 0.22, 0.55);
+    const radius = clamp(metrics.span * 0.01, 0.35, 1.1);
+    const marker = ensurePlaybackMarker(metrics.span);
+    if (marker) {
+      marker.visible = true;
+      marker.scale.setScalar(radius);
+      marker.position.set(
+        sample.point[0],
+        sample.point[1],
+        Math.max(sample.point[2], metrics.min.z) + zLift,
+      );
+    }
+  }
+  updatePathProgressColors(sample.progressIndex);
   markNeedsRender();
 }
 

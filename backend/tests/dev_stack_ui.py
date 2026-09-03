@@ -606,6 +606,8 @@ class DevStackUI:
         command = [
             python,
             str(GENERATE_SCRIPT),
+            "--mode",
+            "quad-video",
             "--port",
             str(RTSP_PORT),
             "--skip-server-check",
@@ -636,7 +638,7 @@ class DevStackUI:
             if self.stream_proc.poll() is not None:
                 raise RuntimeError("推流进程已退出，请查看「推流」日志中的 ffmpeg 错误")
             time.sleep(0.25)
-        self.log("推流已启动 (video=/live, H.264 pose SEI)", channel="stream")
+        self.log("推流已启动 (quad-video=/live, H.264 pose SEI)", channel="stream")
 
     def stop_stream(self) -> None:
         self._run_async("stream_off", "关闭推流", self._stop_stream, button=self.btn_stream_off)

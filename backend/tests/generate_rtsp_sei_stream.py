@@ -6,15 +6,17 @@ Each encoded picture gets one ``user_data_unregistered`` SEI matching
 
     >Qfff = timestamp_ns, x, y, yaw
 
-Timestamps follow the same mapped scene epoch as the barcode publisher
-(first frame 2026-03-24 05:05:48.518 UTC). Pose is interpolated from
-``backend/tests/pcd/scene.json`` when present.
+The first frame uses the source video's rosbag timestamp
+(``2026-03-24 05:05:11.447 UTC``). Pose is interpolated from
+``backend/tests/pcd/scene.json`` when present; its trajectory starts 37.071
+seconds later, so video content and map pose share the same source clock.
 
 The barcode publisher ``generate_rtsp_stream.py`` remains the fallback.
 
 Examples:
     powershell -ExecutionPolicy Bypass -File backend/tests/start_rtsp_server.ps1
     python backend/tests/generate_rtsp_sei_stream.py
+    python backend/tests/generate_rtsp_sei_stream.py --mode quad-video
     python backend/tests/generate_rtsp_sei_stream.py --mode testsrc --no-scene
 """
 
@@ -38,6 +40,10 @@ TESTS_DIR = Path(__file__).resolve().parent
 BACKEND_ROOT = TESTS_DIR.parent
 REPO_ROOT = BACKEND_ROOT.parent
 DEFAULT_SCENE_PATH = TESTS_DIR / "pcd" / "scene.json"
+# ``inspection.mp4`` starts at this rosbag time.  Do not use the first
+# trajectory timestamp here: localization starts 37.071 s after the camera and
+# doing so shifts every video frame relative to the map.
+DEFAULT_VIDEO_TIME_START = "2026-03-24 05:05:11.447"
 
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
@@ -103,11 +109,32 @@ def yaw_from_quaternion(qx: float, qy: float, qz: float, qw: float) -> float:
 
 
 def frame_timestamp_ns(frame_index: int, *, start_s: float, fps: int, duration_s: float | None) -> int:
+    # ``duration_s`` remains in the public helper signature because callers also
+    # use it for pose lookup.  SEI time itself must never jump backwards.
+    _ = duration_s
     media_s = frame_index / max(int(fps), 1)
-    if duration_s is not None and duration_s > 0:
-        media_s = media_s % duration_s
     timestamp_ms = int(round((start_s + media_s) * 1000.0))
     return timestamp_ms * 1_000_000
+
+
+def source_frame_timestamp_ms(
+    frame_index: int,
+    *,
+    start_s: float,
+    fps: int,
+    duration_s: float | None,
+) -> int:
+    """Return the source-video clock used to look up a pose.
+
+    The transmitted SEI timestamp remains monotonic across test-video loops so
+    recording playback has one continuous clock.  The pose lookup wraps with
+    the repeated source video, making every repeated image use the same
+    ``scene.json`` position as it did in the first pass.
+    """
+    media_s = frame_index / max(int(fps), 1)
+    if duration_s is not None and duration_s > 0:
+        media_s %= duration_s
+    return int(round((start_s + media_s) * 1000.0))
 
 
 def metadata_for_frame(
@@ -122,7 +149,13 @@ def metadata_for_frame(
     if poses is None:
         x = y = yaw = 0.0
     else:
-        x, y, yaw = poses.at_ms(timestamp_ns // 1_000_000)
+        pose_timestamp_ms = source_frame_timestamp_ms(
+            frame_index,
+            start_s=start_s,
+            fps=fps,
+            duration_s=duration_s,
+        )
+        x, y, yaw = poses.at_ms(pose_timestamp_ms)
     return FrameMetadata(timestamp_ns=timestamp_ns, x=x, y=y, yaw=yaw)
 
 
@@ -241,7 +274,7 @@ def build_encode_command(
     height: int,
     fps: int,
     video_path: Path | None,
-    time_start: str = barcode_stream.DEFAULT_TIME_START,
+    time_start: str = DEFAULT_VIDEO_TIME_START,
     loop_duration_s: float | None = None,
 ) -> list[str]:
     """Build ffmpeg command that encodes Annex-B H.264 to stdout (no RTSP)."""
@@ -263,7 +296,9 @@ def build_encode_command(
         height=height,
         fontfile=fontfile,
         start_s=start_s,
-        duration_s=duration_s,
+        # Keep the visible frame clock identical to monotonic SEI time.  Only
+        # the scene pose lookup wraps when inspection.mp4 repeats.
+        duration_s=None,
         fps=fps,
         include_barcode=False,
     )
@@ -319,6 +354,49 @@ def build_encode_command(
             "lavfi",
             "-i",
             f"color=c=0x224466:s={tile_w}x{tile_h}:rate={fps}",
+            "-filter_complex",
+            mosaic,
+            "-map",
+            "[vout]",
+            *encode_args,
+        ]
+
+    if mode == "quad-video":
+        if video_path is None:
+            raise ValueError("quad-video mode requires --video")
+        if not video_path.is_file():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        tile_w = max(2, width // 2)
+        tile_h = max(2, height // 2)
+        fit_tile = (
+            f"scale={tile_w}:{tile_h}:force_original_aspect_ratio=decrease,"
+            f"pad={tile_w}:{tile_h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+        )
+        mosaic = (
+            "[0:v]split=4[front_src][rear_src][left_src][right_src];"
+            f"[front_src]{fit_tile},drawtext=text='FRONT':x=24:y=24:fontsize=32:"
+            f"fontcolor=white{fontfile}:box=1:boxcolor=black@0.45[v0];"
+            f"[rear_src]hflip,{fit_tile},drawtext=text='REAR':x=24:y=24:fontsize=32:"
+            f"fontcolor=white{fontfile}:box=1:boxcolor=black@0.45[v1];"
+            f"[left_src]{fit_tile},eq=saturation=0.80,drawtext=text='LEFT':x=24:y=24:fontsize=32:"
+            f"fontcolor=white{fontfile}:box=1:boxcolor=black@0.45[v2];"
+            f"[right_src]hflip,{fit_tile},eq=saturation=1.20,drawtext=text='RIGHT':x=24:y=24:fontsize=32:"
+            f"fontcolor=white{fontfile}:box=1:boxcolor=black@0.45[v3];"
+            "[v0][v1]hstack=inputs=2[top];"
+            "[v2][v3]hstack=inputs=2[bottom];"
+            f"[top][bottom]vstack=inputs=2,{video_chain}[vout]"
+        )
+        return [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-re",
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(video_path),
             "-filter_complex",
             mosaic,
             "-map",
@@ -387,9 +465,9 @@ def _resolve_loop_duration(
         if duration_s <= 0:
             raise ValueError(f"loop duration must be positive, got {duration_s}")
         return duration_s
-    if mode == "video":
+    if mode in {"video", "quad-video"}:
         if video_path is None:
-            raise ValueError("video mode requires --video")
+            raise ValueError(f"{mode} mode requires --video")
         return barcode_stream.probe_media_duration_seconds(video_path, ffmpeg_bin=ffmpeg_bin)
     return None
 
@@ -412,14 +490,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("testsrc", "quad", "video"),
-        default="video",
-        help="video: loop rtsp_test video (default); testsrc: test pattern; quad: 2x2 mosaic",
+        choices=("testsrc", "quad", "quad-video", "video"),
+        default="quad-video",
+        help=(
+            "quad-video: loop the test video as a labeled 2x2 camera mosaic (default); "
+            "video: legacy single picture; testsrc/quad: synthetic patterns"
+        ),
     )
     parser.add_argument("--host", default=barcode_stream.DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=barcode_stream.DEFAULT_PORT)
     parser.add_argument("--path", default=barcode_stream.DEFAULT_PATH)
-    parser.add_argument("--time-start", default=barcode_stream.DEFAULT_TIME_START)
+    parser.add_argument(
+        "--time-start",
+        default=DEFAULT_VIDEO_TIME_START,
+        help=(
+            "UTC timestamp of inspection.mp4's first frame "
+            f"(default: {DEFAULT_VIDEO_TIME_START})"
+        ),
+    )
     parser.add_argument("--skip-server-check", action="store_true")
     parser.add_argument("--width", type=int, default=barcode_stream.DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=barcode_stream.DEFAULT_HEIGHT)
@@ -451,7 +539,9 @@ def main(argv: list[str] | None = None) -> int:
         if not args.skip_server_check:
             barcode_stream.check_rtsp_server(args.host, args.port)
         video_path = (
-            barcode_stream.resolve_video_path(args.video, args.video_dir) if args.mode == "video" else args.video
+            barcode_stream.resolve_video_path(args.video, args.video_dir)
+            if args.mode in {"video", "quad-video"}
+            else args.video
         )
         start_s = barcode_stream.timeline_unix_seconds(args.time_start)
         duration_s = _resolve_loop_duration(
@@ -478,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print("Starting RTSP SEI test stream")
     print(f"  mode   : {args.mode}")
-    if args.mode == "video" and video_path is not None:
+    if args.mode in {"video", "quad-video"} and video_path is not None:
         print(f"  input  : {video_path}")
     print(f"  ffmpeg : {ffmpeg_bin}")
     print(f"  video  : {rtsp_url}")

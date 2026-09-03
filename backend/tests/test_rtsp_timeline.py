@@ -130,6 +130,26 @@ class RtspTimelineTests(unittest.TestCase):
             assert nearest is not None and nearest.metadata is not None
             self.assertEqual(nearest.frame_index, 2)
 
+    def test_copy_sidecars_removes_stale_destination_file_when_source_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            recording = root / "recording.mp4"
+            copied = root / "inspection.mp4"
+            recording.write_bytes(b"new-video")
+            copied.write_bytes(b"old-video")
+            write_recording_timeline_meta(
+                recording,
+                video_start_ts=1_700_000_000_000,
+                source="rtsp_sei",
+            )
+            stale_frames = copied.with_name("inspection.frames.jsonl")
+            stale_frames.write_text('{"frame_index": 0}\n', encoding="utf-8")
+
+            copy_recording_timeline_sidecars(recording, copied)
+
+            self.assertTrue(copied.with_name("inspection.meta.json").is_file())
+            self.assertFalse(stale_frames.exists())
+
     def test_resolve_recording_video_start_ts_prefers_sei(self) -> None:
         sei = FrameMetadata(
             timestamp_ns=1_774_328_748_518_000_000,

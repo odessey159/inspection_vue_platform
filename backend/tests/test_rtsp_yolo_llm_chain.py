@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import runpy
+import json
+import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+from sqlmodel import Session, SQLModel, create_engine, select
 
 # Path is used by monitor wiring tests for ActiveRecordingInfo stubs.
 
 runpy.run_path(str(Path(__file__).with_name("_bootstrap.py")))
 
-from app.models import HazardRule, Project
+from app.models import Finding, HazardRule, Project
 from app.services.analysis_types import FindingSeed
 from app.services.provider import ProviderResponsePayload
 from app.services.provider_YOLO import YoloClipResult, YoloDetectionPayload
@@ -245,6 +250,77 @@ class RtspYoloLlmChainTest(unittest.TestCase):
         self.assertEqual(len(kept), 1)
         self.assertAlmostEqual(kept[0].confidence, 0.88)
 
+    def test_parallel_segments_serialize_dedupe_and_summary_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            test_engine = create_engine(
+                f"sqlite:///{(root / 'analysis.db').as_posix()}",
+                connect_args={"check_same_thread": False},
+            )
+            SQLModel.metadata.create_all(test_engine)
+            artifacts = root / "project"
+            with Session(test_engine) as session:
+                project = Project(
+                    name="parallel-monitor",
+                    status="indexed",
+                    vehicle_id="missing-vehicle",
+                    bag_dir="rtsp://127.0.0.1:18554/live",
+                    standards_dir="/tmp/standards",
+                    artifacts_dir=str(artifacts),
+                    bag_start_ts=1_700_000_000_000,
+                    bag_end_ts=1_700_000_060_000,
+                )
+                session.add(project)
+                session.commit()
+                session.refresh(project)
+                project_id = project.id or 0
+
+            seed = FindingSeed(
+                rule_id="rule-001",
+                title="Missing helmet",
+                time_start_ms=1_700_000_010_000,
+                time_end_ms=1_700_000_011_000,
+                evidence_frame_ts=[1_700_000_010_000],
+                description="same event",
+                confidence=0.9,
+                severity="high",
+            )
+
+            def persist(segment_index: int):
+                return rtsp_yolo_llm_chain._persist_seeds_for_project(
+                    project_id=project_id,
+                    segment_index=segment_index,
+                    seeds=[seed],
+                    notes=[],
+                    diagnostics=[],
+                    selected_model="qwen3.5-plus",
+                    yolo_detection_count=1,
+                    timeline_origin_ms=1_700_000_000_000,
+                    segment_end_ts_ms=1_700_000_030_000 + segment_index * 1000,
+                    clip_path=None,
+                    clip_start_ts_ms=1_700_000_000_000,
+                )
+
+            with patch.object(rtsp_yolo_llm_chain, "engine", test_engine), patch(
+                "app.services.maps.load_map_for_vehicle_id",
+                return_value=None,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    persisted = list(executor.map(persist, (1, 2)))
+
+            self.assertEqual(sum(len(items) for items in persisted), 1)
+            with Session(test_engine) as session:
+                findings = list(session.exec(select(Finding).where(Finding.project_id == project_id)))
+                self.assertEqual(len(findings), 1)
+                refreshed = session.get(Project, project_id)
+                self.assertIsNotNone(refreshed)
+                self.assertEqual(refreshed.findings_count if refreshed else 0, 1)
+
+            summary_path = artifacts / "summaries" / "analysis_summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(summary.get("monitor_llm_segments", [])), 2)
+            test_engine.dispose()
+
 
 class RtspYoloMonitorLlmWiringTest(unittest.TestCase):
     def tearDown(self) -> None:
@@ -275,6 +351,9 @@ class RtspYoloMonitorLlmWiringTest(unittest.TestCase):
                 "rtsp_url": "rtsp://127.0.0.1:18554/live",
                 "output_path": Path("recording.mp4"),
                 "started_at_ms": 1_700_000_000_000,
+                # Deliberately unrelated to the SEI clock: segment offsets must
+                # be measured against this wall clock, not started_at_ms.
+                "wall_started_at_ms": 10**15,
             },
         )()
 

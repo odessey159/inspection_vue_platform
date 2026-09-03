@@ -91,6 +91,7 @@ class ActiveRecordingInfo:
     rtsp_url: str
     output_path: Path
     started_at_ms: int
+    wall_started_at_ms: int = 0
 
 
 def get_active_recording(storage_key: str) -> ActiveRecordingInfo | None:
@@ -111,6 +112,7 @@ def get_active_recording(storage_key: str) -> ActiveRecordingInfo | None:
             rtsp_url=session.rtsp_url,
             output_path=session.output_path,
             started_at_ms=started_at_ms,
+            wall_started_at_ms=int(session.started_at.timestamp() * 1000),
         )
 
 
@@ -376,6 +378,7 @@ def _poll_vehicle(storage_key: str, configured_url: str) -> None:
             name=f"rtsp-recording-{storage_key}",
             daemon=True,
         ).start()
+        _schedule_live_trajectory_refresh(session)
         _schedule_live_analysis_on_connect(session)
     finally:
         with _lock:
@@ -398,12 +401,14 @@ def _seed_vehicle_trajectory_from_timeline(vehicle_id: str, timeline: object) ->
             x=float(x),
             y=float(y),
             yaw=getattr(timeline, "yaw", None),
+            reset_on_time_rewind=True,
         )
     except Exception:
         logger.debug("Failed seeding vehicle trajectory for %s", vehicle_id, exc_info=True)
 
 
 def _schedule_live_trajectory_refresh(session: _ActiveSession) -> None:
+    """Fold the latest pose SEI batch from the growing recording into the map path."""
     with _lock:
         if session.storage_key in _live_trajectory_inflight:
             return

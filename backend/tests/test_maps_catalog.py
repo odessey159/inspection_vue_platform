@@ -91,6 +91,25 @@ class MapCatalogTests(unittest.TestCase):
             self.assertTrue((maps_dir / record.id / "scene.json").is_file())
             self.assertFalse((robots_dir / "local-demo" / "maps" / "scene.json").exists())
 
+    def test_same_sized_scene_files_with_different_content_are_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            maps_dir = root / "maps"
+            source_a = root / "a" / "scene.json"
+            source_b = root / "b" / "scene.json"
+            source_a.parent.mkdir()
+            source_b.parent.mkdir()
+            write_json(source_a, _tiny_scene(1.0))
+            write_json(source_b, _tiny_scene(2.0))
+            self.assertEqual(source_a.stat().st_size, source_b.stat().st_size)
+
+            with patch("app.services.maps.MAPS_DIR", maps_dir):
+                first = import_map(source_a, name="plant-a")
+                second = import_map(source_b, name="plant-b")
+
+            self.assertNotEqual(first.id, second.id)
+            self.assertNotEqual(first.source_fingerprint, second.source_fingerprint)
+
     def test_migrate_legacy_vehicle_maps_dedupes_by_fingerprint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

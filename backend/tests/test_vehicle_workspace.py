@@ -65,6 +65,21 @@ class VehicleWorkspaceUpsertTests(unittest.TestCase):
                             rtsp_vehicle=True,
                         )
                         first_id = first.id
+                        finding = Finding(
+                            project_id=first_id or 0,
+                            finding_uid="preserve-on-reimport",
+                            rule_id="rule-1",
+                            title="existing finding",
+                            time_start_ms=0,
+                            time_end_ms=1000,
+                            description="must survive workspace preparation",
+                            confidence=0.9,
+                        )
+                        session.add(finding)
+                        first.findings_count = 1
+                        session.add(first)
+                        session.commit()
+                        finding_id = finding.id
                         second = prepare_vehicle_workspace(
                             session,
                             name="second",
@@ -76,6 +91,8 @@ class VehicleWorkspaceUpsertTests(unittest.TestCase):
                         self.assertEqual(second.id, first_id)
                         self.assertEqual(second.name, "second")
                         self.assertEqual(second.bag_dir, "rtsp://10.0.0.52:8554/robot")
+                        self.assertEqual(second.findings_count, 1)
+                        self.assertIsNotNone(session.get(Finding, finding_id))
                         fetched = get_project_by_vehicle_id(session, "local-demo")
                         self.assertIsNotNone(fetched)
                         self.assertEqual(fetched.id if fetched is not None else None, first_id)

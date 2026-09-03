@@ -7,6 +7,7 @@ from sqlmodel import Session, delete, select
 
 from ..models import Finding, HazardRule, HazardZone, Project
 from ..settings import YOLO_SAME_TIME_DEDUPE_WINDOW_MS
+from .analysis_coordination import project_analysis_lock
 from .analysis_summary import read_analysis_summary, write_analysis_summary
 from .analysis_types import AnalysisRunResult, AnalysisVideoTarget, FindingSeed
 from .evidence import cache_evidence_frames
@@ -40,33 +41,6 @@ def run_analysis(
             session.refresh(project)
 
     project_id = project.id or 0
-    monitor_finding_ids = [
-        int(finding_id)
-        for finding_id in session.exec(
-            select(Finding.id).where(
-                Finding.project_id == project_id,
-                Finding.analysis_mode == "provider_yolo_monitor",
-            )
-        )
-        if isinstance(finding_id, int)
-    ]
-    if monitor_finding_ids:
-        session.exec(
-            delete(HazardZone).where(
-                HazardZone.project_id == project_id,
-                HazardZone.finding_id.notin_(monitor_finding_ids),
-            )
-        )
-    else:
-        session.exec(delete(HazardZone).where(HazardZone.project_id == project_id))
-    # Preserve live-monitor findings so a manual batch analyze cannot wipe the RTSP main path.
-    session.exec(
-        delete(Finding).where(
-            Finding.project_id == project_id,
-            Finding.analysis_mode != "provider_yolo_monitor",
-        )
-    )
-    session.commit()
 
     rules = list(
         session.exec(
@@ -90,7 +64,14 @@ def run_analysis(
                 "diagnostics": [],
             },
         )
-        _finalize_project(session, project, result, persisted=[])
+        with project_analysis_lock(project_id):
+            try:
+                _delete_replaceable_findings(session, project_id)
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            _finalize_project(session, project, result, persisted=[])
         return []
 
     from .maps import load_map_for_vehicle_id
@@ -108,65 +89,130 @@ def run_analysis(
         session.add(project)
         session.commit()
 
-    if rtsp_live_yolo:
-        result = run_provider_yolo_rtsp_live_analysis(project, rules, model_override=model)
-    elif video_targets:
-        partial_results = [
-            _run_mode_analysis(
+    try:
+        if rtsp_live_yolo:
+            result = run_provider_yolo_rtsp_live_analysis(project, rules, model_override=model)
+        elif video_targets:
+            partial_results = [
+                _run_mode_analysis(
+                    project,
+                    rules,
+                    mode=mode,
+                    model=model,
+                    video_target=target,
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    duration_ms=duration_ms,
+                )
+                for target in video_targets
+            ]
+            result = _merge_analysis_results(mode=mode, model=model, partial_results=partial_results)
+        else:
+            result = _run_mode_analysis(
                 project,
                 rules,
                 mode=mode,
                 model=model,
-                video_target=target,
+                video_target=None,
                 start_ts=start_ts,
                 end_ts=end_ts,
                 duration_ms=duration_ms,
             )
-            for target in video_targets
-        ]
-        result = _merge_analysis_results(mode=mode, model=model, partial_results=partial_results)
+    except Exception as exc:
+        session.rollback()
+        failed = AnalysisRunResult(
+            status="provider_failed" if mode != "demo" else "indexed",
+            findings=[],
+            summary={
+                "analysis_mode": mode,
+                "analysis_model": model,
+                "status": "provider_failed" if mode != "demo" else "indexed",
+                "notes": [],
+                "diagnostics": [str(exc)],
+            },
+        )
+        with project_analysis_lock(project_id):
+            _finalize_project(session, project, failed, persisted=[])
+        raise
+
+    # A failed retry must not destroy the last successful batch result.
+    if result.status == "provider_failed":
+        with project_analysis_lock(project_id):
+            _finalize_project(session, project, result, persisted=[])
+        return []
+
+    with project_analysis_lock(project_id):
+        try:
+            _delete_replaceable_findings(session, project_id)
+            persisted: list[Finding] = []
+            for index, seed in enumerate(result.findings):
+                finding = Finding(
+                    project_id=project_id,
+                    finding_uid=f"{seed.rule_id}-{index:03d}",
+                    rule_id=seed.rule_id,
+                    title=seed.title,
+                    time_start_ms=seed.time_start_ms,
+                    time_end_ms=seed.time_end_ms,
+                    evidence_frame_ts_json=json.dumps(sorted(set(seed.evidence_frame_ts))),
+                    description=seed.description,
+                    confidence=seed.confidence,
+                    needs_review=True,
+                    review_status="pending",
+                    reviewer_notes="",
+                    severity=seed.severity,
+                    analysis_mode=mode,
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
+                )
+                session.add(finding)
+                session.flush()
+                session.refresh(finding)
+                _attach_zone(
+                    session,
+                    project_id,
+                    finding,
+                    trajectory,
+                    trajectory_timestamps,
+                    start_ts,
+                    duration_ms,
+                )
+                persisted.append(finding)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+
+        _finalize_project(session, project, result, persisted)
+        return persisted
+
+
+def _delete_replaceable_findings(session: Session, project_id: int) -> None:
+    """Stage replacement of batch findings while preserving live-monitor rows."""
+    monitor_finding_ids = [
+        int(finding_id)
+        for finding_id in session.exec(
+            select(Finding.id).where(
+                Finding.project_id == project_id,
+                Finding.analysis_mode == "provider_yolo_monitor",
+            )
+        )
+        if isinstance(finding_id, int)
+    ]
+    if monitor_finding_ids:
+        session.exec(
+            delete(HazardZone).where(
+                HazardZone.project_id == project_id,
+                HazardZone.finding_id.notin_(monitor_finding_ids),
+            )
+        )
     else:
-        result = _run_mode_analysis(
-            project,
-            rules,
-            mode=mode,
-            model=model,
-            video_target=None,
-            start_ts=start_ts,
-            end_ts=end_ts,
-            duration_ms=duration_ms,
+        session.exec(delete(HazardZone).where(HazardZone.project_id == project_id))
+    session.exec(
+        delete(Finding).where(
+            Finding.project_id == project_id,
+            Finding.analysis_mode != "provider_yolo_monitor",
         )
-
-    persisted: list[Finding] = []
-    for index, seed in enumerate(result.findings):
-        finding = Finding(
-            project_id=project.id or 0,
-            finding_uid=f"{seed.rule_id}-{index:03d}",
-            rule_id=seed.rule_id,
-            title=seed.title,
-            time_start_ms=seed.time_start_ms,
-            time_end_ms=seed.time_end_ms,
-            evidence_frame_ts_json=json.dumps(sorted(set(seed.evidence_frame_ts))),
-            description=seed.description,
-            confidence=seed.confidence,
-            needs_review=True,
-            review_status="pending",
-            reviewer_notes="",
-            severity=seed.severity,
-            analysis_mode=mode,
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-        )
-        session.add(finding)
-        session.flush()
-        session.refresh(finding)
-        if trajectory:
-            _attach_zone(session, project.id or 0, finding, trajectory, trajectory_timestamps, start_ts, duration_ms)
-        persisted.append(finding)
-    session.commit()
-
-    _finalize_project(session, project, result, persisted)
-    return persisted
+    )
 
 
 def _run_mode_analysis(
@@ -336,7 +382,9 @@ def _attach_zone(
     trajectory_timestamps: list[int],
     start_ts: int,
     duration_ms: int,
-) -> None:
+) -> HazardZone | None:
+    if not trajectory:
+        return None
     midpoint = int((finding.time_start_ms + finding.time_end_ms) / 2)
     point = _pick_trajectory_point(trajectory, trajectory_timestamps, midpoint, start_ts, duration_ms)
     zone = HazardZone(
@@ -351,6 +399,7 @@ def _attach_zone(
     )
     session.add(zone)
     session.flush()
+    return zone
 
 
 def _pick_trajectory_point(

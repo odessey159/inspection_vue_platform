@@ -171,6 +171,7 @@ def extend_vehicle_trajectory_from_pose(
     y: float | None,
     yaw: float | None = None,
     z: float = 0.0,
+    reset_on_time_rewind: bool = False,
 ) -> VehicleTrajectory | None:
     if x is None or y is None:
         return None
@@ -181,7 +182,11 @@ def extend_vehicle_trajectory_from_pose(
         z=float(z),
         yaw=0.0 if yaw is None else float(yaw),
     )
-    return _extend_vehicle_trajectory(vehicle_id, [sample])
+    return _extend_vehicle_trajectory(
+        vehicle_id,
+        [sample],
+        reset_on_time_rewind=reset_on_time_rewind,
+    )
 
 
 def extend_vehicle_trajectory_from_recording(
@@ -205,13 +210,29 @@ def extend_vehicle_trajectory_from_recording(
     return extend_vehicle_trajectory_from_pictures(cleaned, pictures)
 
 
-def _extend_vehicle_trajectory(vehicle_id: str, samples: list[_PoseSample]) -> VehicleTrajectory:
+def _extend_vehicle_trajectory(
+    vehicle_id: str,
+    samples: list[_PoseSample],
+    *,
+    reset_on_time_rewind: bool = False,
+) -> VehicleTrajectory:
     cleaned = (vehicle_id or "").strip()
     if not cleaned:
         return empty_vehicle_trajectory("")
     with _lock:
         record = load_vehicle_trajectory(cleaned)
         changed = False
+        if (
+            reset_on_time_rewind
+            and samples
+            and record.trajectory_timestamps
+            and samples[0].timestamp_ms < record.trajectory_timestamps[-1]
+        ):
+            # A restarted local publisher begins again at inspection.mp4's
+            # source epoch.  Treat that as a new run instead of rejecting every
+            # incoming pose as stale relative to the previous recording.
+            record = empty_vehicle_trajectory(cleaned)
+            changed = True
         for sample in samples:
             if _append_sample(record, sample):
                 changed = True

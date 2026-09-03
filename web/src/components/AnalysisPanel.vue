@@ -53,8 +53,7 @@ const emit = defineEmits<{
 const canAnalyze = computed(() => {
   return Boolean(
     props.project
-    && props.scene
-    && props.scene.points.length > 0
+    && props.visualRuleCount > 0
     && !props.loading
     && !props.liveMonitorActive,
   );

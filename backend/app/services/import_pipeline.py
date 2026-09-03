@@ -250,10 +250,10 @@ def get_project_by_vehicle_id(session: Session, vehicle_id: str) -> Project | No
 
 
 def _clear_project_records(session: Session, project_id: int) -> None:
+    """Stage replacement of project-owned rows in the caller's transaction."""
     session.exec(delete(HazardZone).where(HazardZone.project_id == project_id))
     session.exec(delete(Finding).where(Finding.project_id == project_id))
     session.exec(delete(HazardRule).where(HazardRule.project_id == project_id))
-    session.commit()
 
 
 def prepare_vehicle_workspace(
@@ -270,7 +270,6 @@ def prepare_vehicle_workspace(
     now = datetime.now(timezone.utc)
     project = get_project_by_vehicle_id(session, key)
     if project is not None and project.id is not None:
-        _clear_project_records(session, project.id)
         project.name = name
         project.status = "indexing"
         project.vehicle_id = key
@@ -278,8 +277,6 @@ def prepare_vehicle_workspace(
         project.standards_dir = standards_dir
         if rtsp_vehicle:
             project.point_topic = key
-        project.findings_count = 0
-        project.rules_count = 0
         project.updated_at = now
         session.add(project)
         session.commit()
@@ -397,7 +394,9 @@ def import_project(
         write_json(dataset_summary_path, dataset_summary)
         write_json(rules_path, export_rules_payload(rules))
         sync_rules_to_db(rules)
+        compact_project_runtime(project_dirs["root"])
 
+        _clear_project_records(session, project.id)
         for rule in rules:
             session.add(rule)
 
@@ -421,10 +420,12 @@ def import_project(
 
         session.add(project)
         session.commit()
-        compact_project_runtime(project_dirs["root"])
         session.refresh(project)
         return project
     except Exception:
+        session.rollback()
+        if project.id is not None:
+            project = session.get(Project, project.id) or project
         project.status = "failed"
         project.updated_at = datetime.now(timezone.utc)
         session.add(project)

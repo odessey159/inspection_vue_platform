@@ -11,6 +11,7 @@ after import.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -338,8 +339,11 @@ def _allocate_map_id(preferred: str) -> str:
 
 
 def _source_fingerprint(path: Path) -> str:
-    stat = path.stat()
-    return f"{stat.st_size}:{path.name.lower()}"
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _find_by_fingerprint(fingerprint: str) -> MapRecord | None:

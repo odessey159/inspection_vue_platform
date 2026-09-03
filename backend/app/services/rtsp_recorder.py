@@ -1497,7 +1497,7 @@ def import_rtsp_project(
     skip_server_check: bool = False,
 ) -> Project:
     """Create an RTSP-backed project, parse rules, and adopt the latest completed recording."""
-    from .import_pipeline import prepare_vehicle_workspace
+    from .import_pipeline import _clear_project_records, prepare_vehicle_workspace
     from .rtsp_vehicles import get_vehicle_by_id
 
     source_url = rtsp_url.strip()
@@ -1531,14 +1531,8 @@ def import_rtsp_project(
     if project_id is None:
         raise RuntimeError("Project creation failed")
 
-    rules = parse_rules(standards_dir, project_id)
-    rules_path = project_dirs["summaries"] / "rules.json"
-    write_json(rules_path, export_rules_payload(rules))
-    sync_rules_to_db(rules)
-    for rule in rules:
-        session.add(rule)
-
     try:
+        rules = parse_rules(standards_dir, project_id)
         if not skip_server_check:
             source_url = resolve_recording_rtsp_url(source_url)
         recording_path = require_latest_completed_recording(source_url)
@@ -1550,20 +1544,29 @@ def import_rtsp_project(
             rtsp_transport=rtsp_transport,
             vehicle_id=selected_vehicle_id,
         )
+        rules_path = project_dirs["summaries"] / "rules.json"
+        write_json(rules_path, export_rules_payload(rules))
+        sync_rules_to_db(rules)
+
+        _clear_project_records(session, project_id)
+        for rule in rules:
+            session.add(rule)
+
+        project.rules_count = len(rules)
+        project.findings_count = 0
+        project.rules_path = str(rules_path)
+        project.updated_at = datetime.now(timezone.utc)
+        session.add(project)
+        session.commit()
+        session.refresh(project)
     except Exception:
+        session.rollback()
+        project = session.get(Project, project_id) or project
         project.status = "rtsp_failed"
         project.updated_at = datetime.now(timezone.utc)
         session.add(project)
         session.commit()
         raise
-
-    project.rules_count = len(rules)
-    project.findings_count = 0
-    project.rules_path = str(rules_path)
-    project.updated_at = datetime.now(timezone.utc)
-    session.add(project)
-    session.commit()
-    session.refresh(project)
 
     from .rtsp_auto_analysis import schedule_auto_analysis_for_project
 

@@ -84,8 +84,11 @@ let vehicleSceneRequestId = 0;
 
 const importPanelRef = ref<InstanceType<typeof ImportPanel> | null>(null);
 const FINDINGS_POLL_MS = 5000;
+const TRAJECTORY_POLL_MS = 1000;
 let findingsPollTimer: number | null = null;
 let findingsPollGeneration = 0;
+let trajectoryPollTimer: number | null = null;
+let trajectoryPollGeneration = 0;
 let openProjectGeneration = 0;
 
 const headerVehicles = computed(() => {
@@ -221,8 +224,19 @@ watch(
   ],
   () => {
     scheduleFindingsPoll();
+    scheduleTrajectoryPoll();
   },
   { immediate: true },
+);
+
+watch(
+  [
+    () => scene.value,
+    () => importForm.vehicle_id,
+  ],
+  () => {
+    scheduleTrajectoryPoll();
+  },
 );
 
 onMounted(() => {
@@ -231,6 +245,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   invalidateFindingsPoll();
+  invalidateTrajectoryPoll();
 });
 
 function isRtspLiveMonitorProject(project: ProjectSummary | null): boolean {
@@ -279,6 +294,37 @@ function scheduleFindingsPoll() {
   }, FINDINGS_POLL_MS);
 }
 
+function shouldPollLiveTrajectory() {
+  const vehicleId = currentProject.value?.vehicle_id || importForm.vehicle_id;
+  if (!vehicleId || !scene.value) {
+    return false;
+  }
+  return videoPlaybackMode.value === "live" || isRtspLiveMonitorProject(currentProject.value);
+}
+
+function clearTrajectoryPoll() {
+  if (trajectoryPollTimer !== null) {
+    window.clearInterval(trajectoryPollTimer);
+    trajectoryPollTimer = null;
+  }
+}
+
+function invalidateTrajectoryPoll() {
+  trajectoryPollGeneration += 1;
+  clearTrajectoryPoll();
+}
+
+function scheduleTrajectoryPoll() {
+  invalidateTrajectoryPoll();
+  if (!shouldPollLiveTrajectory()) {
+    return;
+  }
+  void refreshLiveTrajectory();
+  trajectoryPollTimer = window.setInterval(() => {
+    void refreshLiveTrajectory();
+  }, TRAJECTORY_POLL_MS);
+}
+
 function setNotice(message: string) {
   errorMessage.value = "";
   notice.value = message;
@@ -303,7 +349,6 @@ async function refreshLiveFindings() {
     if (generation !== findingsPollGeneration || projectId !== currentProjectId.value) {
       return;
     }
-    await refreshLiveTrajectory();
     if (!projectsMonitorEqual(projects.value, projectPayload)) {
       projects.value = projectPayload;
     }
@@ -323,6 +368,7 @@ async function refreshLiveFindings() {
         notice.value = `实时监控已更新隐患：${merged.findings.length} 条`;
       }
     }
+    syncSceneHazardZones(merged.findings);
     if (!isRtspLiveMonitorProject(currentProject.value)) {
       clearFindingsPoll();
     }
@@ -333,27 +379,61 @@ async function refreshLiveFindings() {
   }
 }
 
+let trajectoryRefreshInFlight = false;
+
 async function refreshLiveTrajectory() {
-  const vehicleId = currentProject.value?.vehicle_id || importForm.vehicle_id;
-  if (!vehicleId || !scene.value) {
+  if (trajectoryRefreshInFlight) {
     return;
   }
+  const targetProjectId = currentProjectId.value;
+  const targetScene = scene.value;
+  const vehicleId = currentProject.value?.vehicle_id || importForm.vehicle_id;
+  if (!vehicleId || !targetScene) {
+    return;
+  }
+  const generation = trajectoryPollGeneration;
+  trajectoryRefreshInFlight = true;
   try {
     const payload = await getVehicleTrajectory(vehicleId);
-    if (!scene.value) {
+    if (
+      generation !== trajectoryPollGeneration
+      || !shouldPollLiveTrajectory()
+      || currentProjectId.value !== targetProjectId
+      || scene.value !== targetScene
+      || (currentProject.value?.vehicle_id || importForm.vehicle_id) !== vehicleId
+    ) {
       return;
     }
-    scene.value.trajectory = payload.trajectory;
-    scene.value.trajectory_timestamps = payload.trajectory_timestamps;
-    scene.value.trajectory_orientations = payload.trajectory_orientations;
-    scene.value.scene_quality = {
-      ...(scene.value.scene_quality ?? {}),
+    targetScene.trajectory = liftTrajectoryToSceneGround(payload.trajectory, targetScene);
+    targetScene.trajectory_timestamps = payload.trajectory_timestamps;
+    targetScene.trajectory_orientations = payload.trajectory_orientations;
+    targetScene.scene_quality = {
+      ...(targetScene.scene_quality ?? {}),
       trajectory_source: payload.point_count ? payload.source : null,
       trajectory_point_count: payload.point_count,
     };
   } catch {
     // Keep the last overlay if the trajectory endpoint is briefly unavailable.
+  } finally {
+    trajectoryRefreshInFlight = false;
   }
+}
+
+function liftTrajectoryToSceneGround(
+  trajectory: [number, number, number][],
+  targetScene: SceneResponse,
+): [number, number, number][] {
+  const groundZ = Number.isFinite(targetScene.floor_cut_default)
+    ? targetScene.floor_cut_default
+    : targetScene.bounds.min[2];
+  return trajectory.map(([x, y, z]) => [x, y, Math.abs(z) < 1e-6 ? groundZ : z]);
+}
+
+function syncSceneHazardZones(snapshot: FindingResponse[]) {
+  if (!scene.value) {
+    return;
+  }
+  scene.value.hazard_zones = snapshot.flatMap((finding) => finding.zone ? [finding.zone] : []);
 }
 
 async function initialize(preferredProjectId: number | null = currentProjectId.value) {
@@ -664,7 +744,8 @@ async function handleRebuildScene() {
   try {
     const result = await rebuildScene(currentProject.value.id);
     await initialize(currentProject.value.id);
-    setNotice(`场景已重建并写入独立地图目录：${result.notes?.at(-1) ?? `${result.render_point_count} 个显示点`}。请在小车上绑定 map_id 后显示。`);
+    const lastNote = result.notes?.length ? result.notes[result.notes.length - 1] : undefined;
+    setNotice(`场景已重建并写入独立地图目录：${lastNote ?? `${result.render_point_count} 个显示点`}。请在小车上绑定 map_id 后显示。`);
   } catch (error) {
     setError(getErrorMessage(error));
   } finally {
@@ -881,13 +962,13 @@ async function openVehicleWorkspaceById(vehicleId: string) {
   }
 }
 
-async function loadSelectedVehicleMap(vehicle: RtspVehicle) {
+async function loadSelectedVehicleMap(vehicle: RtspVehicle): Promise<boolean> {
   const requestId = ++vehicleSceneRequestId;
   if (!vehicle.map_id) {
     scene.value = null;
     vehicleMapStatus.value = "missing";
     vehicleMapMessage.value = `${vehicle.name} 未绑定点云地图`;
-    return;
+    return true;
   }
   vehicleMapStatus.value = "loading";
   vehicleMapMessage.value = `正在按索引加载地图 ${vehicle.map_id}...`;
@@ -895,17 +976,26 @@ async function loadSelectedVehicleMap(vehicle: RtspVehicle) {
   notice.value = "";
   setBusy(`加载地图 ${vehicle.map_id}...`);
   try {
-    const payload = await getVehicleScene(vehicle.id);
+    const matchingProject = currentProject.value?.vehicle_id === vehicle.id
+      ? currentProject.value
+      : null;
+    const payload = matchingProject
+      ? await getSceneOptional(matchingProject.id, "lidar")
+      : await getVehicleScene(vehicle.id);
     if (requestId !== vehicleSceneRequestId) {
-      return;
+      return false;
+    }
+    if (!payload) {
+      throw new Error(`地图 ${vehicle.map_id} 尚未生成可加载场景`);
     }
     scene.value = alignSceneToProjectVideoClock(payload, currentProject.value);
     vehicleMapStatus.value = "ready";
     vehicleMapMessage.value = `已显示地图 ${vehicle.map_id}（${vehicle.name}）`;
     setNotice(vehicleMapMessage.value);
+    return true;
   } catch (error) {
     if (requestId !== vehicleSceneRequestId) {
-      return;
+      return false;
     }
     scene.value = null;
     const message = getErrorMessage(error);
@@ -917,6 +1007,7 @@ async function loadSelectedVehicleMap(vehicle: RtspVehicle) {
     if (!missing) {
       setError(vehicleMapMessage.value);
     }
+    return false;
   } finally {
     if (requestId === vehicleSceneRequestId) {
       clearBusy();
@@ -933,7 +1024,10 @@ async function handleAssignVehicleMap(vehicleId: string, mapId: string | null) {
     bootstrap.value = bootstrapPayload;
     importPanelRef.value?.applyUpdatedVehicle(updated);
     const vehicle = bootstrapPayload.rtsp_vehicles.find((item) => item.id === vehicleId) ?? updated;
-    await loadSelectedVehicleMap(vehicle);
+    const loaded = await loadSelectedVehicleMap(vehicle);
+    if (!loaded) {
+      return;
+    }
     setNotice(mapId ? `已绑定地图 ${mapId}` : "已清除该车的地图绑定");
   } catch (error) {
     setError(getErrorMessage(error));

@@ -271,9 +271,11 @@ def ensure_recording_frame_metadata(recording_path: Path) -> tuple[PictureMetada
 def copy_recording_timeline_sidecars(source_video: Path, destination_video: Path) -> None:
     for sidecar_for in (recording_timeline_meta_path, recording_frames_path):
         source = sidecar_for(source_video)
-        if not source.is_file():
-            continue
         destination = sidecar_for(destination_video)
+        if not source.is_file():
+            if destination.is_file():
+                destination.unlink()
+            continue
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(source.read_bytes())
 

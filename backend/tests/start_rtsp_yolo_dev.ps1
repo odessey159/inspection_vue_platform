@@ -177,7 +177,7 @@ try {
         Start-MediaMtx -Port $RtspPort
 
         Write-Step "RTSP publisher (pose SEI)"
-        $publishCmd = "python `"$TestsDir\generate_rtsp_sei_stream.py`" --port $RtspPort"
+        $publishCmd = "python `"$TestsDir\generate_rtsp_sei_stream.py`" --mode quad-video --port $RtspPort"
         $script:ChildProcesses += Start-DevWindow `
             -Title "RTSP Publisher" `
             -WorkingDirectory $RepoRoot `

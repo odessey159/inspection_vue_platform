@@ -595,22 +595,28 @@ def _dedupe_seeds(
         return sorted(deduped.values(), key=lambda item: (item.time_start_ms, item.rule_id))
 
     window = int(same_time_window_ms)
-    kept: list[FindingSeed] = []
+    # Keep a stable cluster origin even when a later, higher-confidence seed is
+    # selected as the representative. Otherwise the window can drift forever.
+    kept: list[tuple[int, FindingSeed]] = []
     for seed in sorted(seeds, key=lambda item: (item.rule_id, item.time_start_ms, -item.confidence)):
         match_index = None
-        for index, current in enumerate(kept):
+        for index, (cluster_start_ms, current) in enumerate(kept):
             if current.rule_id != seed.rule_id:
                 continue
-            if abs(int(current.time_start_ms) - int(seed.time_start_ms)) > window:
+            if abs(cluster_start_ms - int(seed.time_start_ms)) > window:
                 continue
             match_index = index
             break
         if match_index is None:
-            kept.append(seed)
+            kept.append((int(seed.time_start_ms), seed))
             continue
-        if seed.confidence > kept[match_index].confidence:
-            kept[match_index] = seed
-    return sorted(kept, key=lambda item: (item.time_start_ms, item.rule_id))
+        cluster_start_ms, current = kept[match_index]
+        if seed.confidence > current.confidence:
+            kept[match_index] = (cluster_start_ms, seed)
+    return sorted(
+        (item for _cluster_start_ms, item in kept),
+        key=lambda item: (item.time_start_ms, item.rule_id),
+    )
 
 
 

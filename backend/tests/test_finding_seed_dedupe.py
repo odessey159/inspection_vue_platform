@@ -62,6 +62,16 @@ class FindingSeedDedupeTest(unittest.TestCase):
         deduped = _dedupe_seeds(seeds, same_time_window_ms=2000)
         self.assertEqual(len(deduped), 2)
 
+    def test_same_time_window_does_not_drift_with_higher_confidence(self) -> None:
+        seeds = [
+            _seed("rule-a", start_ms=0, confidence=0.6),
+            _seed("rule-a", start_ms=1900, confidence=0.7),
+            _seed("rule-a", start_ms=3800, confidence=0.8),
+        ]
+        deduped = _dedupe_seeds(seeds, same_time_window_ms=2000)
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual([item.time_start_ms for item in deduped], [1900, 3800])
+
 
 if __name__ == "__main__":
     unittest.main()

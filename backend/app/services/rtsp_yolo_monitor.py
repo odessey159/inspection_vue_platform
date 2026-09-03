@@ -77,8 +77,8 @@ def stop_all_rtsp_yolo_monitors() -> None:
         stop_event.set()
 
 
-def _resolve_timeline_origin_ms(storage_key: str, monitor_started_ms: int) -> int:
-    """Anchor finding timestamps to the watchdog recording clock when available."""
+def _resolve_timeline_clock_ms(storage_key: str, monitor_started_ms: int) -> tuple[int, int]:
+    """Return the media timestamp origin and its matching wall-clock origin."""
     try:
         from .rtsp_watchdog import get_active_recording
 
@@ -86,8 +86,9 @@ def _resolve_timeline_origin_ms(storage_key: str, monitor_started_ms: int) -> in
     except Exception:
         active = None
     if active is not None and active.started_at_ms > 0:
-        return active.started_at_ms
-    return monitor_started_ms
+        wall_started_at_ms = int(getattr(active, "wall_started_at_ms", 0) or 0)
+        return active.started_at_ms, wall_started_at_ms or monitor_started_ms
+    return monitor_started_ms, monitor_started_ms
 
 
 def _capture_segment_clip(
@@ -150,7 +151,10 @@ def _monitor_loop(
     try:
         while not stop_event.is_set():
             clip_index = f"rtsp_watch_{storage_key}_{segment_index:06d}"
-            timeline_origin_ms = _resolve_timeline_origin_ms(storage_key, monitor_started_ms)
+            timeline_origin_ms, wall_origin_ms = _resolve_timeline_clock_ms(
+                storage_key,
+                monitor_started_ms,
+            )
 
             capture_path: Path | None = None
             try:
@@ -167,7 +171,7 @@ def _monitor_loop(
                 )
 
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-                segment_end_sec = max(0.0, (now_ms - timeline_origin_ms) / 1000.0)
+                segment_end_sec = max(0.0, (now_ms - wall_origin_ms) / 1000.0)
                 segment_start_sec = max(0.0, segment_end_sec - segment_seconds)
                 segment_abs_start_ts = timeline_origin_ms + int(round(segment_start_sec * 1000))
 

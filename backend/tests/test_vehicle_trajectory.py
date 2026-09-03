@@ -14,6 +14,7 @@ from app.services.rtsp_vehicles import update_vehicle_map_id  # noqa: E402
 from app.services.storage import write_json  # noqa: E402
 from app.services.vehicle_trajectory import (  # noqa: E402
     extend_vehicle_trajectory_from_pictures,
+    extend_vehicle_trajectory_from_pose,
     load_vehicle_trajectory,
     overlay_vehicle_trajectory,
     strip_catalog_trajectory,
@@ -116,6 +117,27 @@ class VehicleTrajectoryTests(unittest.TestCase):
             self.assertAlmostEqual(scene["trajectory"][0][2], 1.2)
             self.assertEqual(scene["scene_quality"].get("trajectory_source"), "rtsp_sei")
             self.assertNotEqual(scene["trajectory"], [[4.0, 0, 0], [5.0, 0, 0]])
+
+    def test_new_stream_session_resets_path_when_timestamp_rewinds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            robots_dir = Path(tmp_dir) / "robots"
+            with patch("app.services.rtsp_vehicles.ROBOTS_DIR", robots_dir):
+                extend_vehicle_trajectory_from_pictures(
+                    "local-demo",
+                    [_picture(50_000, 8.0, 9.0), _picture(51_000, 8.4, 9.1)],
+                )
+                restarted = extend_vehicle_trajectory_from_pose(
+                    "local-demo",
+                    timestamp_ms=10_000,
+                    x=1.0,
+                    y=2.0,
+                    reset_on_time_rewind=True,
+                )
+
+            self.assertIsNotNone(restarted)
+            assert restarted is not None
+            self.assertEqual(restarted.trajectory_timestamps, [10_000])
+            self.assertEqual(restarted.trajectory, [[1.0, 2.0, 0.0]])
 
     def test_overlay_empty_until_rtsp_poses_exist(self) -> None:
         scene = overlay_vehicle_trajectory(_tiny_scene(1.0), "missing-vehicle")

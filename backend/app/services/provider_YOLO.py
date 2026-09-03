@@ -160,12 +160,10 @@ def run_provider_yolo_rtsp_live_analysis(
     analysis_started_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     storage_key = resolve_storage_key_for_rtsp_url(resolved_url)
     active_recording = get_active_recording(storage_key) if watchdog_recording else None
-    analysis_start_offset_sec = 0.0
-    if active_recording is not None and active_recording.started_at_ms > 0:
-        analysis_start_offset_sec = max(
-            0.0,
-            (analysis_started_ms - active_recording.started_at_ms) / 1000.0,
-        )
+    analysis_start_offset_sec = _active_recording_offset_sec(
+        active_recording,
+        analysis_started_ms=analysis_started_ms,
+    )
 
     try:
         if watchdog_recording:
@@ -675,6 +673,18 @@ def _clip_relative_time_sec(clip: PreparedClip, time_sec: float | None) -> float
     else:
         relative = time_sec
     return max(0.0, min(clip.duration_sec, relative))
+
+
+def _active_recording_offset_sec(active: object | None, *, analysis_started_ms: int) -> float:
+    """Measure the capture offset on the watchdog wall clock, never its SEI clock."""
+    if active is None:
+        return 0.0
+    wall_started_at_ms = int(getattr(active, "wall_started_at_ms", 0) or 0)
+    if wall_started_at_ms <= 0:
+        # Older/test ActiveRecordingInfo objects may not expose the wall clock.
+        # Starting at zero is safe; treating the media timestamp as wall time is not.
+        return 0.0
+    return max(0.0, (int(analysis_started_ms) - wall_started_at_ms) / 1000.0)
 
 
 def _recording_from_active_watchdog(

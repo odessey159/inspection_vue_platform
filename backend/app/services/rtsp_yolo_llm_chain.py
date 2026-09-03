@@ -39,6 +39,7 @@ from ..settings import (
     resolve_vision_model,
 )
 from .analysis_summary import read_analysis_summary, write_analysis_summary
+from .analysis_coordination import project_analysis_lock
 from .analysis_types import FindingSeed
 from .evidence import append_evidence_frames_from_clip
 from .provider import (
@@ -642,6 +643,36 @@ def _persist_seeds_for_project(
     clip_start_ts_ms: int,
 ) -> list[Finding]:
     """Append segment findings without wiping prior analysis results."""
+    with project_analysis_lock(project_id):
+        return _persist_seeds_for_project_locked(
+            project_id=project_id,
+            segment_index=segment_index,
+            seeds=seeds,
+            notes=notes,
+            diagnostics=diagnostics,
+            selected_model=selected_model,
+            yolo_detection_count=yolo_detection_count,
+            timeline_origin_ms=timeline_origin_ms,
+            segment_end_ts_ms=segment_end_ts_ms,
+            clip_path=clip_path,
+            clip_start_ts_ms=clip_start_ts_ms,
+        )
+
+
+def _persist_seeds_for_project_locked(
+    *,
+    project_id: int,
+    segment_index: int,
+    seeds: list[FindingSeed],
+    notes: list[str],
+    diagnostics: list[str],
+    selected_model: str,
+    yolo_detection_count: int,
+    timeline_origin_ms: int,
+    segment_end_ts_ms: int,
+    clip_path: Path | None,
+    clip_start_ts_ms: int,
+) -> list[Finding]:
     with Session(engine) as session:
         project = session.get(Project, project_id)
         if project is None:
@@ -723,7 +754,7 @@ def _persist_seeds_for_project(
             select(func.count()).select_from(Finding).where(Finding.project_id == project_id)
         ).one()
         project.findings_count = total_findings_count
-        if project.status not in {"indexing"}:
+        if project.status not in {"indexing", "provider_analyzing"}:
             project.status = "provider_analyzed" if project.findings_count > 0 else "indexed"
         project.updated_at = datetime.now(timezone.utc)
         session.add(project)

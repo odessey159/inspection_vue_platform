@@ -9,6 +9,7 @@ from unittest.mock import patch
 runpy.run_path(str(Path(__file__).with_name("_bootstrap.py")))
 
 from app.services import rtsp_recorder
+from app.services.provider_YOLO import _active_recording_offset_sec
 
 
 class ResolveStorageKeyTest(unittest.TestCase):
@@ -87,6 +88,29 @@ class ClipRelativeTimeTest(unittest.TestCase):
         # Absolute times before the clip window clamp to the clip start.
         self.assertEqual(_clip_relative_time_sec(clip, 5.0), 0.0)
         self.assertEqual(_clip_relative_time_sec(clip, 60.0), 25.0)
+
+
+class ActiveRecordingClockTest(unittest.TestCase):
+    def test_offset_uses_watchdog_wall_clock_not_sei_clock(self) -> None:
+        active = type(
+            "Active",
+            (),
+            {
+                "started_at_ms": 1_700_000_000_000,
+                "wall_started_at_ms": 1_788_000_000_000,
+            },
+        )()
+        self.assertEqual(
+            _active_recording_offset_sec(active, analysis_started_ms=1_788_000_012_500),
+            12.5,
+        )
+
+    def test_legacy_active_recording_never_treats_sei_as_wall_clock(self) -> None:
+        active = type("Active", (), {"started_at_ms": 1_700_000_000_000})()
+        self.assertEqual(
+            _active_recording_offset_sec(active, analysis_started_ms=1_788_000_012_500),
+            0.0,
+        )
 
 
 if __name__ == "__main__":

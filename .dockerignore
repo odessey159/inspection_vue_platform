@@ -2,6 +2,7 @@
 .gitignore
 .runtime
 .venv
+venv
 **/__pycache__
 **/*.pyc
 **/.pytest_cache
@@ -9,8 +10,15 @@
 **/dist
 output
 inputs
+.env
+.env.local
+backend/.env
+backend/.env.local
+web/.env
+web/.env.local
 backend/.venv
 backend/extracted
 backend/scenes
 backend/summaries
+backend/models/**/*.pt
 hazard_recognition_sample/outputs

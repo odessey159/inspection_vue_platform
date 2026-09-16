@@ -115,13 +115,45 @@ inspection_vue_platform/
 ├─ docker-compose.yml
 ├─ docker-run.ps1
 ├─ docker-run.sh
+├─ start_console.py            # Windows 本机服务控制台（标准库 + Tk）
+├─ start_console.bat
+├─ start_console.ps1
+├─ AGENTS.md                   # Cursor / 编码助手说明
 ├─ ARCHITECTURE.md
 └─ CONFIGURATION.md
 ```
 
 ## 3. 快速开始
 
+本地需要 **Python 3.11+**、**Node.js 18+**。后端依赖用 pip 安装 `backend/requirements.txt`，虚拟环境放在 `backend/.venv`；前端用 `web/package-lock.json` 安装。不要用 `pip freeze` 覆盖仓库里的依赖清单。
+
+从示例生成配置：
+
+```powershell
+Copy-Item .env.example .env
+# 仅本机调试后端时还可以：
+Copy-Item backend\.env.example backend\.env
+```
+
 ### 3.1 本地开发运行
+
+**Windows 本机控制台（推荐）：**
+
+```powershell
+.\start_console.bat
+# 或
+.\start_console.ps1
+```
+
+控制台可分别启动前端（Vite `:5173`）、后端 API（`:8010`）和 YOLO（`:8001`，内部调用 `backend\scripts\run_yolo_service.ps1`）。不启动服务、只检查本机环境：
+
+```powershell
+python start_console.py --check
+# 或
+.\start_console.ps1 -Check
+```
+
+**分服务手动启动**
 
 **后端：**
 
@@ -157,6 +189,13 @@ npm run dev
 - 后端 API：`http://127.0.0.1:8010`
 - YOLO 服务：`http://127.0.0.1:8001`
 - 健康检查：`http://127.0.0.1:8010/healthz`
+
+不启动服务、不连设备的后端单测（需已安装 `backend/requirements.txt`；YOLO 服务相关用例还需 `requirements-yolo.txt`）：
+
+```powershell
+Set-Location backend
+python -m unittest discover -s tests -v
+```
 
 ### 3.2 Docker 一键启动
 

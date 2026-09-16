@@ -1,39 +1,71 @@
+# Local runtime (DB, recordings, robot maps, logs)
 .runtime/
+
+# Secrets and machine-local config
 .env
 .env.local
+backend/.env
+backend/.env.local
+web/.env
+web/.env.local
+docker-compose.override.yml
+
+# Python environments and caches
 .venv/
+venv/
 __pycache__/
 *.pyc
+*.egg-info/
+.eggs/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 htmlcov/
+
+# Frontend
 node_modules/
 dist/
+web/.vite/
+
+# OS junk
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# Generated logs and temp files
 *.log
 *.tmp
+
+# Local databases and ROS bags (runtime/input data, not source).
+# Tracked fixtures under backend/tests/ stay tracked; gitignore does not untrack them.
 *.db
 *.sqlite
 *.sqlite3
 *.db3
 *.bag
 *.mcap
-backend/.env.local
-backend/.env
-web/.env
-web/.env.local
+
+# App extract/output dirs
 output/
 backend/extracted/
 backend/scenes/
 backend/summaries/
 hazard_recognition_sample/outputs/
+
+# Host input data (keep directory placeholders)
 inputs/*
 !inputs/.gitkeep
 !inputs/standards/
 inputs/standards/*
 !inputs/standards/.gitkeep
+
+# YOLO weights (large; place locally)
 backend/models/**/*.pt
 !backend/models/YOLO/.gitkeep
+
+# IDE and local SSH key material
+.idea/
+id_rsa
+id_rsa.pub
+*.ppk
